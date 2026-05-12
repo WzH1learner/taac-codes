@@ -100,6 +100,75 @@ Notes for S01:
 - Before official eval, confirm checkpoint has `model.pt`, `train_config.json`, and `schema.json`.
 - For any future `group` tokenizer run, checkpoint must also include `ns_groups.json`.
 
+## 2026-05-14 Review Checklist
+
+Platform R01 status:
+
+```text
+The platform-submitted run.sh is intended to run R01, not a D01 repeat:
+R01 = D01 + seq_recent_stats residual
+```
+
+R01 startup log must contain:
+
+```text
+use_seq_recent_stats=1
+seq_recent_stats_dim=28
+seq_recent_stats_gate_init=0.1
+seq_encoder_type=transformer
+user_dense_projector_type=grouped
+use_time_context=0
+T=16
+```
+
+If `use_seq_recent_stats=0`, mark the run invalid as a D01 repeat.
+
+D02 startup / train_config must contain:
+
+```text
+seq_encoder_type=swiglu
+user_dense_projector_type=grouped
+use_time_context=0
+use_seq_recent_stats=0
+```
+
+For each finished D02/R01 run, record:
+
+```text
+checkpoint path
+best epoch / best step
+best valid AUC
+valid LogLoss
+valid Brier
+valid prob_mean / label_mean
+train_config.json key fields
+whether model.pt / schema.json / train_config.json exist
+```
+
+Eval upload rule:
+
+```text
+D02 eval: current new eval package is OK; old eval should also work because swiglu/transformer already exist.
+R01 eval: must upload the new eval/ directory because checkpoint contains seq_recent_stats projector/gate.
+```
+
+Minimum R01 eval files:
+
+```text
+eval/dataset.py
+eval/model.py
+eval/infer.py
+```
+
+Decision shortcut:
+
+```text
+Eval whichever of D02/R01 has valid AUC closest to or above 0.864399 and does not break LogLoss/Brier/prob_mean.
+If both are clearly worse than D01, preserve official eval quota.
+```
+
+Do not start new model experiments before D02/R01 official eval decisions are made. Pair EDA may run after training as analysis only.
+
 ## Do Not Spend Training Or Official Eval On
 
 | Direction | Reason |
