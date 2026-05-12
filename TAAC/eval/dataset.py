@@ -174,6 +174,8 @@ BUCKET_BOUNDARIES = np.array([
 # That is why ``train.py`` / ``infer.py`` only expose the boolean flag
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
+SEQ_RECENT_STATS_PER_DOMAIN = 7
+SEQ_RECENT_STATS_DIM = 4 * SEQ_RECENT_STATS_PER_DOMAIN
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -289,6 +291,9 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
         self._time_context_dim = 2 + len(self.seq_domains) * 3
         self._buf_time_context = np.zeros((B, self._time_context_dim), dtype=np.float32)
+        self._seq_recent_stats_dim = len(self.seq_domains) * SEQ_RECENT_STATS_PER_DOMAIN
+        self._buf_seq_recent_stats = np.zeros((B, self._seq_recent_stats_dim), dtype=np.float32)
+        self._seq_recent_stats_logged = False
         self._buf_seq = {}
         self._buf_seq_tb = {}
         self._buf_seq_td = {}
@@ -633,6 +638,25 @@ class PCVRParquetDataset(IterableDataset):
 
         return padded
 
+    def _maybe_log_seq_recent_stats(self, stats: "npt.NDArray[np.float32]") -> None:
+        """Log one compact diagnostic line for the residual recency features."""
+        if self._seq_recent_stats_logged or stats.size == 0:
+            return
+        preview_dim = min(8, stats.shape[1])
+        head = stats[:, :preview_dim]
+        means = head.mean(axis=0)
+        max_vals = head.max(axis=0)
+        zero_rates = (head == 0).mean(axis=0)
+        logging.info(
+            "seq_recent_stats diagnostics: dim=%d, head_mean=%s, head_max=%s, "
+            "head_zero_rate=%s",
+            stats.shape[1],
+            np.array2string(means, precision=4, separator=','),
+            np.array2string(max_vals, precision=4, separator=','),
+            np.array2string(zero_rates, precision=4, separator=','),
+        )
+        self._seq_recent_stats_logged = True
+
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
         """Convert an Arrow RecordBatch into a training-ready dict of tensors."""
         B = batch.num_rows
@@ -718,6 +742,8 @@ class PCVRParquetDataset(IterableDataset):
         time_context[:, 1] = (
             np.log1p(np.maximum(root_dt, 0)) / np.log1p(2_000_000_000)
         ).astype(np.float32)
+        seq_recent_stats = self._buf_seq_recent_stats[:B]
+        seq_recent_stats[:] = 0.0
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain_idx, domain in enumerate(self.seq_domains):
@@ -822,6 +848,19 @@ class PCVRParquetDataset(IterableDataset):
                     mean_gap[rows_with_ts] = (
                         gap.sum(axis=1)[rows_with_ts] / valid_count[rows_with_ts]
                     )
+                    recent_30m = (valid_ts & (gap <= 1800)).sum(axis=1).astype(np.float32)
+                    recent_2h = (valid_ts & (gap <= 7200)).sum(axis=1).astype(np.float32)
+                    recent_1d = (valid_ts & (gap <= 86400)).sum(axis=1).astype(np.float32)
+                    stats_base = domain_idx * SEQ_RECENT_STATS_PER_DOMAIN
+                    seq_recent_stats[:, stats_base] = np.log1p(valid_count)
+                    seq_recent_stats[:, stats_base + 1] = np.log1p(last_gap)
+                    seq_recent_stats[:, stats_base + 2] = np.log1p(mean_gap)
+                    seq_recent_stats[:, stats_base + 3] = np.log1p(recent_30m)
+                    seq_recent_stats[:, stats_base + 4] = np.log1p(recent_2h)
+                    seq_recent_stats[:, stats_base + 5] = np.log1p(recent_1d)
+                    seq_recent_stats[:, stats_base + 6] = (
+                        recent_2h / np.maximum(valid_count, 1.0)
+                    )
                 base = 2 + domain_idx * 3
                 denom = np.log1p(float(max_delta))
                 time_context[:, base] = np.log1p(np.minimum(last_gap, max_delta)) / denom
@@ -834,6 +873,8 @@ class PCVRParquetDataset(IterableDataset):
             result[f'{domain}_time_delta'] = torch.from_numpy(time_delta.copy())
 
         result['time_context'] = torch.from_numpy(time_context.copy())
+        result['seq_recent_stats'] = torch.from_numpy(seq_recent_stats.copy())
+        self._maybe_log_seq_recent_stats(seq_recent_stats)
         return result
 
 

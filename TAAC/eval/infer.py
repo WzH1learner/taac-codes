@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS
+from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS, SEQ_RECENT_STATS_DIM
 from model import PCVRHyFormer, ModelInput
 
 
@@ -67,6 +67,9 @@ _FALLBACK_MODEL_CFG = {
     'use_seq_time_delta_proj': False,
     'use_time_context': False,
     'time_context_dim': 14,
+    'use_seq_recent_stats': False,
+    'seq_recent_stats_dim': SEQ_RECENT_STATS_DIM,
+    'seq_recent_stats_gate_init': 0.1,
     'emb_skip_threshold': 5000000,
     'seq_id_threshold': 10000,
     'ns_tokenizer_type': 'rankmixer',
@@ -464,6 +467,7 @@ def _batch_to_model_input(
         seq_time_buckets=seq_time_buckets,
         seq_time_deltas=seq_time_deltas,
         time_context=device_batch.get('time_context', None),
+        seq_recent_stats=device_batch.get('seq_recent_stats', None),
     )
 
 
@@ -510,6 +514,13 @@ def main() -> None:
 
     # ---- Build model: every structural hyperparameter is resolved from train_config ----
     model_cfg = resolve_model_cfg(train_config)
+    logging.info(
+        "Effective seq_recent_stats config: use_seq_recent_stats=%s, "
+        "seq_recent_stats_dim=%s, seq_recent_stats_gate_init=%s",
+        model_cfg.get('use_seq_recent_stats'),
+        model_cfg.get('seq_recent_stats_dim'),
+        model_cfg.get('seq_recent_stats_gate_init'),
+    )
 
     # ns_groups_json also comes from training config (e.g. run.sh may have
     # passed an empty string to disable it). When trainer.py has copied the

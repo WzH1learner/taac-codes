@@ -19,7 +19,7 @@ from typing import List, Tuple
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS, SEQ_RECENT_STATS_DIM
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -172,6 +172,11 @@ def parse_args() -> argparse.Namespace:
                              'existing discrete time-bucket embedding.')
     parser.add_argument('--use_time_context', type=int, default=0, choices=[0, 1],
                         help='Add root/domain time summary context into the single user_dense token')
+    parser.add_argument('--use_seq_recent_stats', type=int, default=0, choices=[0, 1],
+                        help='Add relative per-sequence recency/intensity stats as a residual '
+                             'to the final representation')
+    parser.add_argument('--seq_recent_stats_gate_init', type=float, default=0.1,
+                        help='Initial scalar residual gate for --use_seq_recent_stats')
     parser.add_argument('--user_dense_projector_type', type=str, default='flat',
                         choices=['flat', 'grouped'],
                         help='flat keeps the legacy concat projection; grouped uses fid-aware dense branches')
@@ -239,6 +244,7 @@ def parse_args() -> argparse.Namespace:
                              '(0 = automatically use the number of item groups)')
 
     args = parser.parse_args()
+    args.seq_recent_stats_dim = SEQ_RECENT_STATS_DIM
 
     # Environment variables take precedence.
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
@@ -262,6 +268,12 @@ def main() -> None:
         f"reinit_sparse_after_epoch={args.reinit_sparse_after_epoch}, "
         f"reinit_cardinality_threshold={args.reinit_cardinality_threshold}, "
         f"num_epochs={args.num_epochs}, patience={args.patience}"
+    )
+    logging.info(
+        "Effective seq_recent_stats config: "
+        f"use_seq_recent_stats={args.use_seq_recent_stats}, "
+        f"seq_recent_stats_dim={args.seq_recent_stats_dim}, "
+        f"seq_recent_stats_gate_init={args.seq_recent_stats_gate_init}"
     )
 
     # ---- Data loading ----
@@ -346,6 +358,9 @@ def main() -> None:
         "use_seq_time_delta_proj": args.use_seq_time_delta_proj,
         "use_time_context": bool(args.use_time_context),
         "time_context_dim": 2 + len(pcvr_dataset.seq_domains) * 3,
+        "use_seq_recent_stats": bool(args.use_seq_recent_stats),
+        "seq_recent_stats_dim": args.seq_recent_stats_dim,
+        "seq_recent_stats_gate_init": args.seq_recent_stats_gate_init,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
         "ns_tokenizer_type": args.ns_tokenizer_type,
