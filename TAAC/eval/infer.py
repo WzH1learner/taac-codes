@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS, SEQ_RECENT_STATS_DIM
+from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS, PAIR_DENSE_DIM, SEQ_RECENT_STATS_DIM
 from model import PCVRHyFormer, ModelInput
 
 
@@ -70,6 +70,9 @@ _FALLBACK_MODEL_CFG = {
     'use_seq_recent_stats': False,
     'seq_recent_stats_dim': SEQ_RECENT_STATS_DIM,
     'seq_recent_stats_gate_init': 0.1,
+    'use_pair_dense': False,
+    'pair_dense_dim': PAIR_DENSE_DIM,
+    'pair_dense_gate_init': 0.05,
     'emb_skip_threshold': 5000000,
     'seq_id_threshold': 10000,
     'ns_tokenizer_type': 'rankmixer',
@@ -468,6 +471,7 @@ def _batch_to_model_input(
         seq_time_deltas=seq_time_deltas,
         time_context=device_batch.get('time_context', None),
         seq_recent_stats=device_batch.get('seq_recent_stats', None),
+        pair_dense_feats=device_batch.get('pair_dense_feats', None),
     )
 
 
@@ -508,6 +512,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        pair_dense_pairs=train_config.get('pair_dense_pairs', None),
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
@@ -520,6 +525,13 @@ def main() -> None:
         model_cfg.get('use_seq_recent_stats'),
         model_cfg.get('seq_recent_stats_dim'),
         model_cfg.get('seq_recent_stats_gate_init'),
+    )
+    logging.info(
+        "Effective pair_dense config: use_pair_dense=%s, "
+        "pair_dense_dim=%s, pair_dense_gate_init=%s",
+        model_cfg.get('use_pair_dense'),
+        model_cfg.get('pair_dense_dim'),
+        model_cfg.get('pair_dense_gate_init'),
     )
 
     # ns_groups_json also comes from training config (e.g. run.sh may have

@@ -176,6 +176,17 @@ BUCKET_BOUNDARIES = np.array([
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 SEQ_RECENT_STATS_PER_DOMAIN = 7
 SEQ_RECENT_STATS_DIM = 4 * SEQ_RECENT_STATS_PER_DOMAIN
+DEFAULT_PAIR_DENSE_PAIRS: List[List[Any]] = [
+    [13, "seq_d", 25],
+    [81, "seq_d", 25],
+    [9, "seq_d", 25],
+    [5, "seq_d", 25],
+    [83, "seq_d", 25],
+    [10, "seq_d", 25],
+    [6, "seq_d", 24],
+]
+PAIR_DENSE_FEATS_PER_PAIR = 7
+PAIR_DENSE_DIM = len(DEFAULT_PAIR_DENSE_PAIRS) * PAIR_DENSE_FEATS_PER_PAIR
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -202,6 +213,7 @@ class PCVRParquetDataset(IterableDataset):
         timestamp_max: Optional[int] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        pair_dense_pairs: Optional[List[List[Any]]] = None,
     ) -> None:
         """
         Args:
@@ -227,6 +239,8 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            pair_dense_pairs: optional ``[[item_fid, domain, side_fid], ...]``
+                list for target-history pair features.
         """
         super().__init__()
 
@@ -278,6 +292,9 @@ class PCVRParquetDataset(IterableDataset):
 
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
+        self.pair_dense_pairs = self._normalize_pair_dense_pairs(pair_dense_pairs)
+        self.pair_dense_dim = len(self.pair_dense_pairs) * PAIR_DENSE_FEATS_PER_PAIR
+        self._pair_dense_specs_by_domain = self._build_pair_dense_specs()
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
@@ -294,6 +311,8 @@ class PCVRParquetDataset(IterableDataset):
         self._seq_recent_stats_dim = len(self.seq_domains) * SEQ_RECENT_STATS_PER_DOMAIN
         self._buf_seq_recent_stats = np.zeros((B, self._seq_recent_stats_dim), dtype=np.float32)
         self._seq_recent_stats_logged = False
+        self._buf_pair_dense_feats = np.zeros((B, self.pair_dense_dim), dtype=np.float32)
+        self._pair_dense_feats_logged = False
         self._buf_seq = {}
         self._buf_seq_tb = {}
         self._buf_seq_td = {}
@@ -657,6 +676,115 @@ class PCVRParquetDataset(IterableDataset):
         )
         self._seq_recent_stats_logged = True
 
+    def _normalize_pair_dense_pairs(
+        self,
+        pair_dense_pairs: Optional[List[List[Any]]],
+    ) -> List[Tuple[int, str, int]]:
+        raw_pairs = pair_dense_pairs if pair_dense_pairs else DEFAULT_PAIR_DENSE_PAIRS
+        normalized: List[Tuple[int, str, int]] = []
+        for pair in raw_pairs:
+            if len(pair) != 3:
+                raise ValueError(f"pair_dense pair must be [item_fid, domain, side_fid], got {pair}")
+            item_fid, domain, side_fid = pair
+            normalized.append((int(item_fid), str(domain), int(side_fid)))
+        return normalized
+
+    def _build_pair_dense_specs(self) -> Dict[str, List[Tuple[int, int, int, int, int, int]]]:
+        item_offsets = {
+            fid: (offset, length)
+            for fid, offset, length in self.item_int_schema.entries
+        }
+        specs_by_domain: Dict[str, List[Tuple[int, int, int, int, int, int]]] = {}
+        for pair_idx, (item_fid, domain, side_fid) in enumerate(self.pair_dense_pairs):
+            if item_fid not in item_offsets:
+                logging.warning("pair_dense: item_fid=%s missing from schema; feature kept zero", item_fid)
+                continue
+            side_fids = self.sideinfo_fids.get(domain)
+            if not side_fids or side_fid not in side_fids:
+                logging.warning(
+                    "pair_dense: %s side_fid=%s missing from schema; feature kept zero",
+                    domain,
+                    side_fid,
+                )
+                continue
+            item_offset, item_len = item_offsets[item_fid]
+            side_slot = side_fids.index(side_fid)
+            specs_by_domain.setdefault(domain, []).append(
+                (pair_idx, item_offset, item_len, side_slot, item_fid, side_fid)
+            )
+        logging.info(
+            "pair_dense configured: pairs=%s, dim=%d, active_specs=%d",
+            self.pair_dense_pairs,
+            self.pair_dense_dim,
+            sum(len(v) for v in specs_by_domain.values()),
+        )
+        return specs_by_domain
+
+    def _maybe_log_pair_dense_feats(self, feats: "npt.NDArray[np.float32]") -> None:
+        if self._pair_dense_feats_logged or feats.size == 0:
+            return
+        preview_dim = min(8, feats.shape[1])
+        head = feats[:, :preview_dim]
+        means = head.mean(axis=0)
+        max_vals = head.max(axis=0)
+        zero_rates = (head == 0).mean(axis=0)
+        logging.info(
+            "pair_dense_feats diagnostics: dim=%d, head_mean=%s, head_max=%s, "
+            "head_zero_rate=%s",
+            feats.shape[1],
+            np.array2string(means, precision=4, separator=','),
+            np.array2string(max_vals, precision=4, separator=','),
+            np.array2string(zero_rates, precision=4, separator=','),
+        )
+        self._pair_dense_feats_logged = True
+
+    def _fill_pair_dense_for_domain(
+        self,
+        domain: str,
+        item_int: "npt.NDArray[np.int64]",
+        seq_sideinfo: "npt.NDArray[np.int64]",
+        pair_dense_feats: "npt.NDArray[np.float32]",
+        ts_padded: Optional["npt.NDArray[np.int64]"],
+        root_ts: "npt.NDArray[np.int64]",
+    ) -> None:
+        specs = self._pair_dense_specs_by_domain.get(domain)
+        if not specs:
+            return
+        B = item_int.shape[0]
+        L = seq_sideinfo.shape[2]
+        if ts_padded is not None:
+            valid_ts = ts_padded > 0
+            gap = np.maximum(root_ts.reshape(B, 1) - ts_padded, 0).astype(np.float32)
+        else:
+            valid_ts = np.zeros((B, L), dtype=bool)
+            gap = np.zeros((B, L), dtype=np.float32)
+
+        for pair_idx, item_offset, item_len, side_slot, _item_fid, _side_fid in specs:
+            base = pair_idx * PAIR_DENSE_FEATS_PER_PAIR
+            side_vals = seq_sideinfo[:, side_slot, :]
+            for i in range(B):
+                targets = item_int[i, item_offset:item_offset + item_len]
+                targets = targets[targets > 0]
+                if targets.size == 0:
+                    continue
+                matches = np.isin(side_vals[i], targets) & (side_vals[i] > 0)
+                match_count = int(matches.sum())
+                if match_count == 0:
+                    continue
+                valid_matches = matches & valid_ts[i]
+                recent_2h = int((valid_matches & (gap[i] <= 7200)).sum())
+                recent_1d = int((valid_matches & (gap[i] <= 86400)).sum())
+                latest_gap = float(gap[i][valid_matches].min()) if valid_matches.any() else 0.0
+                pair_dense_feats[i, base:base + PAIR_DENSE_FEATS_PER_PAIR] = (
+                    1.0,
+                    np.log1p(match_count),
+                    1.0 if recent_2h > 0 else 0.0,
+                    np.log1p(recent_2h),
+                    1.0 if recent_1d > 0 else 0.0,
+                    np.log1p(recent_1d),
+                    np.log1p(latest_gap) if latest_gap > 0 else 0.0,
+                )
+
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
         """Convert an Arrow RecordBatch into a training-ready dict of tensors."""
         B = batch.num_rows
@@ -744,6 +872,8 @@ class PCVRParquetDataset(IterableDataset):
         ).astype(np.float32)
         seq_recent_stats = self._buf_seq_recent_stats[:B]
         seq_recent_stats[:] = 0.0
+        pair_dense_feats = self._buf_pair_dense_feats[:B]
+        pair_dense_feats[:] = 0.0
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain_idx, domain in enumerate(self.seq_domains):
@@ -796,6 +926,7 @@ class PCVRParquetDataset(IterableDataset):
             time_bucket[:] = 0
             time_delta = self._buf_seq_td[domain][:B]
             time_delta[:] = 0.0
+            ts_padded = None
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
@@ -869,12 +1000,22 @@ class PCVRParquetDataset(IterableDataset):
                     np.log1p(valid_count) / np.log1p(float(max_len))
                 )
 
+            self._fill_pair_dense_for_domain(
+                domain,
+                item_int,
+                out,
+                pair_dense_feats,
+                ts_padded,
+                timestamps,
+            )
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
             result[f'{domain}_time_delta'] = torch.from_numpy(time_delta.copy())
 
         result['time_context'] = torch.from_numpy(time_context.copy())
         result['seq_recent_stats'] = torch.from_numpy(seq_recent_stats.copy())
+        result['pair_dense_feats'] = torch.from_numpy(pair_dense_feats.copy())
         self._maybe_log_seq_recent_stats(seq_recent_stats)
+        self._maybe_log_pair_dense_feats(pair_dense_feats)
         return result
 
 
@@ -893,6 +1034,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    pair_dense_pairs: Optional[List[List[Any]]] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -1030,6 +1172,7 @@ def get_pcvr_data(
         timestamp_min=train_timestamp_min,
         timestamp_max=train_timestamp_max,
         clip_vocab=clip_vocab,
+        pair_dense_pairs=pair_dense_pairs,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -1054,6 +1197,7 @@ def get_pcvr_data(
         timestamp_min=valid_timestamp_min,
         timestamp_max=valid_timestamp_max,
         clip_vocab=clip_vocab,
+        pair_dense_pairs=pair_dense_pairs,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

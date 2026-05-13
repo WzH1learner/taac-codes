@@ -19,6 +19,7 @@ class ModelInput(NamedTuple):
     seq_time_deltas: dict  # {domain: tensor [B, L]}, normalized log time gap
     time_context: Optional[torch.Tensor] = None  # [B, 2 + num_domains * 3]
     seq_recent_stats: Optional[torch.Tensor] = None  # [B, 4 domains * 7 stats]
+    pair_dense_feats: Optional[torch.Tensor] = None  # [B, selected_pairs * 7 stats]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1304,6 +1305,24 @@ class SeqRecentStatsProjector(nn.Module):
         return self.net(x)
 
 
+class PairDenseProjector(nn.Module):
+    """Project target-history exact-match features to one residual vector."""
+
+    def __init__(self, input_dim: int, d_model: int, hidden_mult: int = 2) -> None:
+        super().__init__()
+        hidden_dim = max(d_model, d_model * hidden_mult)
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1345,6 +1364,9 @@ class PCVRHyFormer(nn.Module):
         use_seq_recent_stats: Union[bool, int] = False,
         seq_recent_stats_dim: int = 28,
         seq_recent_stats_gate_init: float = 0.1,
+        use_pair_dense: Union[bool, int] = False,
+        pair_dense_dim: int = 49,
+        pair_dense_gate_init: float = 0.05,
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
         # NS tokenizer variant
@@ -1369,6 +1391,8 @@ class PCVRHyFormer(nn.Module):
         self.time_context_dim = int(time_context_dim)
         self.use_seq_recent_stats = bool(use_seq_recent_stats)
         self.seq_recent_stats_dim = int(seq_recent_stats_dim)
+        self.use_pair_dense = bool(use_pair_dense)
+        self.pair_dense_dim = int(pair_dense_dim)
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
@@ -1578,6 +1602,20 @@ class PCVRHyFormer(nn.Module):
             )
         else:
             logging.info("seq_recent_stats disabled")
+        if self.use_pair_dense:
+            self.pair_dense_proj = PairDenseProjector(
+                input_dim=self.pair_dense_dim,
+                d_model=d_model,
+            )
+            self.pair_dense_gate = nn.Parameter(
+                torch.tensor(float(pair_dense_gate_init), dtype=torch.float32))
+            logging.info(
+                "pair_dense enabled: dim=%d, gate_init=%.4f",
+                self.pair_dense_dim,
+                float(pair_dense_gate_init),
+            )
+        else:
+            logging.info("pair_dense disabled")
 
         # Dropout
         self.emb_dropout = nn.Dropout(dropout_rate)
@@ -1822,6 +1860,19 @@ class PCVRHyFormer(nn.Module):
         )
         return final_repr + self.seq_recent_stats_gate.to(final_repr.dtype) * self.seq_recent_stats_proj(stats)
 
+    def _apply_pair_dense(
+        self,
+        final_repr: torch.Tensor,
+        inputs: ModelInput,
+    ) -> torch.Tensor:
+        if not self.use_pair_dense or inputs.pair_dense_feats is None:
+            return final_repr
+        feats = inputs.pair_dense_feats.to(
+            device=final_repr.device,
+            dtype=final_repr.dtype,
+        )
+        return final_repr + self.pair_dense_gate.to(final_repr.dtype) * self.pair_dense_proj(feats)
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -1861,6 +1912,7 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=self.training
         )
         output = self._apply_seq_recent_stats(output, inputs)
+        output = self._apply_pair_dense(output, inputs)
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -1902,6 +1954,7 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=False
         )
         output = self._apply_seq_recent_stats(output, inputs)
+        output = self._apply_pair_dense(output, inputs)
 
         logits = self.clsfier(output)
         return logits, output

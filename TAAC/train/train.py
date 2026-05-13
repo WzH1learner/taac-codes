@@ -14,12 +14,19 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS, SEQ_RECENT_STATS_DIM
+from dataset import (
+    DEFAULT_PAIR_DENSE_PAIRS,
+    FeatureSchema,
+    NUM_TIME_BUCKETS,
+    PAIR_DENSE_FEATS_PER_PAIR,
+    SEQ_RECENT_STATS_DIM,
+    get_pcvr_data,
+)
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -36,6 +43,15 @@ def build_feature_specs(
         vs = max(per_position_vocab_sizes[offset:offset + length])
         specs.append((vs, offset, length))
     return specs
+
+
+def load_pair_dense_pairs(pair_dense_pairs_json: str) -> List[List[Any]]:
+    if not pair_dense_pairs_json:
+        return DEFAULT_PAIR_DENSE_PAIRS
+    if os.path.exists(pair_dense_pairs_json):
+        with open(pair_dense_pairs_json, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return json.loads(pair_dense_pairs_json)
 
 
 def parse_args() -> argparse.Namespace:
@@ -177,6 +193,14 @@ def parse_args() -> argparse.Namespace:
                              'to the final representation')
     parser.add_argument('--seq_recent_stats_gate_init', type=float, default=0.1,
                         help='Initial scalar residual gate for --use_seq_recent_stats')
+    parser.add_argument('--use_pair_dense', type=int, default=0, choices=[0, 1],
+                        help='Add selected target-history exact-match features as a residual '
+                             'to the final representation')
+    parser.add_argument('--pair_dense_gate_init', type=float, default=0.05,
+                        help='Initial scalar residual gate for --use_pair_dense')
+    parser.add_argument('--pair_dense_pairs_json', type=str, default='',
+                        help='Path to or inline JSON list of [item_fid, domain, side_fid] '
+                             'pairs; empty uses built-in P2 v1 pairs')
     parser.add_argument('--user_dense_projector_type', type=str, default='flat',
                         choices=['flat', 'grouped'],
                         help='flat keeps the legacy concat projection; grouped uses fid-aware dense branches')
@@ -245,6 +269,8 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
     args.seq_recent_stats_dim = SEQ_RECENT_STATS_DIM
+    args.pair_dense_pairs = load_pair_dense_pairs(args.pair_dense_pairs_json)
+    args.pair_dense_dim = len(args.pair_dense_pairs) * PAIR_DENSE_FEATS_PER_PAIR
 
     # Environment variables take precedence.
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
@@ -274,6 +300,13 @@ def main() -> None:
         f"use_seq_recent_stats={args.use_seq_recent_stats}, "
         f"seq_recent_stats_dim={args.seq_recent_stats_dim}, "
         f"seq_recent_stats_gate_init={args.seq_recent_stats_gate_init}"
+    )
+    logging.info(
+        "Effective pair_dense config: "
+        f"use_pair_dense={args.use_pair_dense}, "
+        f"pair_dense_dim={args.pair_dense_dim}, "
+        f"pair_dense_gate_init={args.pair_dense_gate_init}, "
+        f"pair_dense_pairs={args.pair_dense_pairs}"
     )
 
     # ---- Data loading ----
@@ -307,6 +340,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        pair_dense_pairs=args.pair_dense_pairs,
     )
 
     # ---- NS groups ----
@@ -361,6 +395,9 @@ def main() -> None:
         "use_seq_recent_stats": bool(args.use_seq_recent_stats),
         "seq_recent_stats_dim": args.seq_recent_stats_dim,
         "seq_recent_stats_gate_init": args.seq_recent_stats_gate_init,
+        "use_pair_dense": bool(args.use_pair_dense),
+        "pair_dense_dim": args.pair_dense_dim,
+        "pair_dense_gate_init": args.pair_dense_gate_init,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
         "ns_tokenizer_type": args.ns_tokenizer_type,
