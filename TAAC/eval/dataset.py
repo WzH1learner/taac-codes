@@ -313,6 +313,8 @@ class PCVRParquetDataset(IterableDataset):
         self._seq_recent_stats_logged = False
         self._buf_pair_dense_feats = np.zeros((B, self.pair_dense_dim), dtype=np.float32)
         self._pair_dense_feats_logged = False
+        self._pair_dense_future_ts_filtered_count = 0
+        self._pair_dense_valid_ts_count = 0
         self._buf_seq = {}
         self._buf_seq_tb = {}
         self._buf_seq_td = {}
@@ -730,11 +732,14 @@ class PCVRParquetDataset(IterableDataset):
         zero_rates = (head == 0).mean(axis=0)
         logging.info(
             "pair_dense_feats diagnostics: dim=%d, head_mean=%s, head_max=%s, "
-            "head_zero_rate=%s",
+            "head_zero_rate=%s, future_ts_filtered_count=%d, "
+            "future_ts_filtered_rate=%.6f",
             feats.shape[1],
             np.array2string(means, precision=4, separator=','),
             np.array2string(max_vals, precision=4, separator=','),
             np.array2string(zero_rates, precision=4, separator=','),
+            self._pair_dense_future_ts_filtered_count,
+            self._pair_dense_future_ts_filtered_count / max(self._pair_dense_valid_ts_count, 1),
         )
         self._pair_dense_feats_logged = True
 
@@ -753,10 +758,15 @@ class PCVRParquetDataset(IterableDataset):
         B = item_int.shape[0]
         L = seq_sideinfo.shape[2]
         if ts_padded is not None:
+            raw_gap = root_ts.reshape(B, 1) - ts_padded
             valid_ts = ts_padded > 0
-            gap = np.maximum(root_ts.reshape(B, 1) - ts_padded, 0).astype(np.float32)
+            historical_valid_mask = valid_ts & (raw_gap >= 0)
+            future_ts_mask = valid_ts & (raw_gap < 0)
+            self._pair_dense_future_ts_filtered_count += int(future_ts_mask.sum())
+            self._pair_dense_valid_ts_count += int(valid_ts.sum())
+            gap = np.maximum(raw_gap, 0).astype(np.float32)
         else:
-            valid_ts = np.zeros((B, L), dtype=bool)
+            historical_valid_mask = np.zeros((B, L), dtype=bool)
             gap = np.zeros((B, L), dtype=np.float32)
 
         for pair_idx, item_offset, item_len, side_slot, _item_fid, _side_fid in specs:
@@ -767,14 +777,17 @@ class PCVRParquetDataset(IterableDataset):
                 targets = targets[targets > 0]
                 if targets.size == 0:
                     continue
-                matches = np.isin(side_vals[i], targets) & (side_vals[i] > 0)
+                matches = (
+                    np.isin(side_vals[i], targets)
+                    & (side_vals[i] > 0)
+                    & historical_valid_mask[i]
+                )
                 match_count = int(matches.sum())
                 if match_count == 0:
                     continue
-                valid_matches = matches & valid_ts[i]
-                recent_2h = int((valid_matches & (gap[i] <= 7200)).sum())
-                recent_1d = int((valid_matches & (gap[i] <= 86400)).sum())
-                latest_gap = float(gap[i][valid_matches].min()) if valid_matches.any() else 0.0
+                recent_2h = int((matches & (gap[i] <= 7200)).sum())
+                recent_1d = int((matches & (gap[i] <= 86400)).sum())
+                latest_gap = float(gap[i][matches].min())
                 pair_dense_feats[i, base:base + PAIR_DENSE_FEATS_PER_PAIR] = (
                     1.0,
                     np.log1p(match_count),
