@@ -36,6 +36,22 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --amp_dtype bfloat16 \
     "$@"
 
+# ---- F00 fast-screening timing / compile usage ----
+# Default active D01 stays no-compile. Extra args are appended through "$@".
+#
+# D01 no-compile timing:
+#   bash TAAC/train/run.sh
+#
+# D01 compile baseline for fast screening:
+#   bash TAAC/train/run.sh --torch_compile --compile_mode reduce-overhead
+#
+# Optional compile smoke test, only verifies the path runs and is not an AUC decision:
+#   bash TAAC/train/run.sh --torch_compile --compile_mode reduce-overhead --num_epochs 2 --train_ratio 0.2
+#
+# Compare compile experiments only against D01_compile_baseline. If a direction
+# works under compile, retrain no-compile before spending official eval unless
+# the checkpoint is explicitly marked as compile.
+
 # ---- D02 rejected: grouped dense + SwiGLU ----
 # Clean result: valid AUC=0.864255, LogLoss=0.223297, official AUC=0.81476.
 # Conclusion: swiglu + grouped dense is weaker than D01; keep archived only.

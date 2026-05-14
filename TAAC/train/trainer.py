@@ -8,6 +8,7 @@ import os
 import glob
 import shutil
 import logging
+import time
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
@@ -356,6 +357,8 @@ class PCVRHyFormerRankingTrainer:
         total_step = 0
 
         for epoch in range(1, self.num_epochs + 1):
+            epoch_start = time.perf_counter()
+            train_start = time.perf_counter()
             train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                               dynamic_ncols=True)
             loss_sum = 0.0
@@ -396,14 +399,29 @@ class PCVRHyFormerRankingTrainer:
                 for key, value in metric_sums.items()
             }
             train_epoch_metrics['loss'] = loss_sum / len(self.train_loader)
+            train_seconds = time.perf_counter() - train_start
             logging.info(f"Epoch {epoch}, Average Loss: {train_epoch_metrics['loss']}")
             self._log_scalar_metrics('TrainEpoch', train_epoch_metrics, total_step, log_to_file=True)
 
+            valid_start = time.perf_counter()
             val_auc, val_logloss, val_metrics = self.evaluate(epoch=epoch)
+            valid_seconds = time.perf_counter() - valid_start
             self.model.train()
             torch.cuda.empty_cache()
 
             logging.info(f"Epoch {epoch} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
+            epoch_seconds = time.perf_counter() - epoch_start
+            avg_step_seconds = train_seconds / max(metric_count, 1)
+            logging.info(
+                "F00 timing | epoch=%d | train_seconds=%.3f | valid_seconds=%.3f | "
+                "epoch_seconds=%.3f | steps=%d | avg_step_seconds=%.6f",
+                epoch,
+                train_seconds,
+                valid_seconds,
+                epoch_seconds,
+                metric_count,
+                avg_step_seconds,
+            )
 
             self._log_scalar_metrics('Valid', val_metrics, total_step, log_to_file=True)
 

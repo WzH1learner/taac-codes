@@ -34,6 +34,28 @@ prob_mean/label_mean are candidate filters only.
 | Global recency / time_context | Rejected | T01 and R01 both failed official eval. Do not continue root timestamp, weekday/hour bucket, or global recency stats. |
 | SwiGLU route | Downgraded | Clean D02 official `0.814760` is below D01 `0.818095`. |
 
+## F00_fast_screening
+
+Purpose: reduce experiment feedback time. F00 is for screening and timing, not
+for declaring final official results.
+
+| Run | Command | Use |
+| --- | --- | --- |
+| `D01_no_compile_timing` | `bash TAAC/train/run.sh` | Current D01 unchanged, with epoch timing logs. |
+| `D01_compile_baseline` | `bash TAAC/train/run.sh --torch_compile --compile_mode reduce-overhead` | Compile baseline for later compile-only screening comparisons. |
+| Compile smoke | `bash TAAC/train/run.sh --torch_compile --compile_mode reduce-overhead --num_epochs 2 --train_ratio 0.2` | Only verifies that compile path runs; not an AUC decision. |
+
+Rules:
+
+```text
+compile=True is only for direction screening.
+All compile experiments must be compared with D01_compile_baseline.
+Compile results must not be directly compared with no-compile D01 official best.
+If a direction works under compile, retrain it no-compile before official eval.
+Official eval should prefer no-compile checkpoints unless explicitly marked compile.
+Default run.sh behavior stays D01 no-compile.
+```
+
 ## Pair EDA Findings
 
 Small EDA run:
