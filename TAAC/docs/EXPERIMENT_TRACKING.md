@@ -30,9 +30,42 @@ prob_mean/label_mean are candidate filters only.
 
 | Direction | Status | Rationale |
 | --- | --- | --- |
-| `P2_pair_time_match` | Next feature candidate | Pair EDA shows stable target-history exact-match signal around `seq_d` side_fid `25`, especially item_fid `13`. This is not global recency; it is target-specific history match plus recency. |
+| `A01_aligned_user_int_dense_weighted_pooling_no_compile` | Next main experiment | Uses README same-fid alignment between `user_int_feats_{fid}` and `user_dense_feats_{fid}` as a small final residual. Default off; no compile. |
+| `P2_pair_time_match` | Paused candidate | Pair EDA shows target-history exact-match signal, but current priority is A01. Do not continue P2 v1/v2 until A01 is closed. |
 | Global recency / time_context | Rejected | T01 and R01 both failed official eval. Do not continue root timestamp, weekday/hour bucket, or global recency stats. |
 | SwiGLU route | Downgraded | Clean D02 official `0.814760` is below D01 `0.818095`. |
+
+## A01_aligned_user_int_dense_weighted_pooling_no_compile
+
+Code status: implemented behind a default-off switch. Current D01 active path
+keeps `use_aligned_user_int_dense=0`.
+
+Only variable vs D01:
+
+```text
+--use_aligned_user_int_dense 1
+--aligned_user_int_dense_gate_init 0.05
+--aligned_user_int_dense_fids_json ""
+```
+
+Design:
+
+```text
+candidate fids = 62, 63, 64, 65, 66, 89, 90, 91
+reuse existing user_int embedding tables
+same-fid user_dense values become weights for valid user_int ids
+pooled aligned vectors -> small MLP -> final residual
+final_repr = final_repr + aligned_gate * aligned_repr
+```
+
+Guardrails:
+
+```text
+No RankMixer token is added.
+Do not enable time_context, seq_recent_stats, or pair_dense.
+Do not change loss/lr/dropout/seq_len/emb_skip_threshold.
+Run no-compile only; F00b reduce-overhead compile is rejected.
+```
 
 ## F00_fast_screening
 
@@ -42,18 +75,23 @@ for declaring final official results.
 | Run | Command | Use |
 | --- | --- | --- |
 | `D01_no_compile_timing` | `bash TAAC/train/run.sh` | Current D01 unchanged, with epoch timing logs. |
-| `D01_compile_baseline` | `bash TAAC/train/run.sh --torch_compile --compile_mode reduce-overhead` | Compile baseline for later compile-only screening comparisons. |
-| Compile smoke | `bash TAAC/train/run.sh --torch_compile --compile_mode reduce-overhead --num_epochs 2 --train_ratio 0.2` | Only verifies that compile path runs; not an AUC decision. |
+| `F00b_D01_compile_baseline` | `bash TAAC/train/run.sh --torch_compile --compile_mode reduce-overhead` | Rejected: crashed on cloud before epoch 1 completed. |
 
-Rules:
+Failure signature:
 
 ```text
-compile=True is only for direction screening.
-All compile experiments must be compared with D01_compile_baseline.
-Compile results must not be directly compared with no-compile D01 official best.
-If a direction works under compile, retrain it no-compile before official eval.
-Official eval should prefer no-compile checkpoints unless explicitly marked compile.
-Default run.sh behavior stays D01 no-compile.
+RuntimeError: Expected curr_block->next == nullptr to be true, but got false
+location: torch/_inductor/cudagraph_trees.py / _cuda_setCheckpointPoolState
+```
+
+Decision:
+
+```text
+Do not use --torch_compile --compile_mode reduce-overhead on the cloud runtime.
+There is no valid D01_compile_baseline.
+Do not compare future experiments against compile numbers.
+Continue with no-compile D01 timing as the only valid F00 record.
+Default run.sh behavior remains D01 no-compile.
 ```
 
 ## Pair EDA Findings

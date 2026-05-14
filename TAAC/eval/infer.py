@@ -73,6 +73,9 @@ _FALLBACK_MODEL_CFG = {
     'use_pair_dense': False,
     'pair_dense_dim': PAIR_DENSE_DIM,
     'pair_dense_gate_init': 0.05,
+    'use_aligned_user_int_dense': False,
+    'aligned_user_int_dense_gate_init': 0.05,
+    'aligned_user_int_dense_fids': [62, 63, 64, 65, 66, 89, 90, 91],
     'emb_skip_threshold': 5000000,
     'seq_id_threshold': 10000,
     'ns_tokenizer_type': 'rankmixer',
@@ -389,6 +392,7 @@ def build_model(
         item_int_feature_specs=item_int_feature_specs,
         user_dense_dim=dataset.user_dense_schema.total_dim,
         item_dense_dim=dataset.item_dense_schema.total_dim,
+        user_int_feature_fids=dataset.user_int_schema.feature_ids(),
         user_dense_feature_specs=dataset.user_dense_schema.entries,
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
@@ -532,6 +536,13 @@ def main() -> None:
         model_cfg.get('use_pair_dense'),
         model_cfg.get('pair_dense_dim'),
         model_cfg.get('pair_dense_gate_init'),
+    )
+    logging.info(
+        "Effective aligned_user_int_dense config: use_aligned_user_int_dense=%s, "
+        "aligned_user_int_dense_gate_init=%s, aligned_user_int_dense_fids=%s",
+        model_cfg.get('use_aligned_user_int_dense'),
+        model_cfg.get('aligned_user_int_dense_gate_init'),
+        model_cfg.get('aligned_user_int_dense_fids'),
     )
 
     # ns_groups_json also comes from training config (e.g. run.sh may have

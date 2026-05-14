@@ -36,21 +36,55 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --amp_dtype bfloat16 \
     "$@"
 
-# ---- F00 fast-screening timing / compile usage ----
+# ---- F00 fast-screening timing / compile status ----
 # Default active D01 stays no-compile. Extra args are appended through "$@".
 #
 # D01 no-compile timing:
 #   bash TAAC/train/run.sh
 #
-# D01 compile baseline for fast screening:
-#   bash TAAC/train/run.sh --torch_compile --compile_mode reduce-overhead
+# F00b_D01_compile_baseline with:
+#   --torch_compile --compile_mode reduce-overhead
+# failed on cloud with a PyTorch Inductor CUDA graph allocator error:
+#   RuntimeError: Expected curr_block->next == nullptr ...
+# Treat reduce-overhead compile as rejected/invalid for this environment.
+# Do not use compile metrics as a screening baseline.
+
+# ---- A01 candidate: aligned user_int/user_dense weighted pooling ----
+# Purpose: use same-fid user_dense values as weights over aligned user_int
+# embeddings. Only variable vs active D01:
+#     --use_aligned_user_int_dense 0 -> 1
 #
-# Optional compile smoke test, only verifies the path runs and is not an AUC decision:
-#   bash TAAC/train/run.sh --torch_compile --compile_mode reduce-overhead --num_epochs 2 --train_ratio 0.2
-#
-# Compare compile experiments only against D01_compile_baseline. If a direction
-# works under compile, retrain no-compile before spending official eval unless
-# the checkpoint is explicitly marked as compile.
+# python3 -u "${SCRIPT_DIR}/train.py" \
+#     --seq_encoder_type transformer \
+#     --ns_tokenizer_type rankmixer \
+#     --user_ns_tokens 5 \
+#     --item_ns_tokens 2 \
+#     --num_queries 2 \
+#     --ns_groups_json "" \
+#     --user_dense_projector_type grouped \
+#     --use_time_context 0 \
+#     --use_seq_recent_stats 0 \
+#     --seq_recent_stats_gate_init 0.1 \
+#     --use_pair_dense 0 \
+#     --pair_dense_gate_init 0.05 \
+#     --pair_dense_pairs_json "" \
+#     --use_aligned_user_int_dense 1 \
+#     --aligned_user_int_dense_gate_init 0.05 \
+#     --aligned_user_int_dense_fids_json "" \
+#     --emb_skip_threshold 5000000 \
+#     --batch_size 128 \
+#     --num_workers 8 \
+#     --seq_max_lens "seq_a:128,seq_b:128,seq_c:256,seq_d:256" \
+#     --num_epochs 20 \
+#     --sparse_lr 0.05 \
+#     --dropout_rate 0.01 \
+#     --patience 15 \
+#     --reinit_sparse_after_epoch 0 \
+#     --reinit_cardinality_threshold 0 \
+#     --loss_type bce \
+#     --amp \
+#     --amp_dtype bfloat16 \
+#     "$@"
 
 # ---- D02 rejected: grouped dense + SwiGLU ----
 # Clean result: valid AUC=0.864255, LogLoss=0.223297, official AUC=0.81476.

@@ -31,6 +31,9 @@ from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
 
+DEFAULT_ALIGNED_USER_INT_DENSE_FIDS = [62, 63, 64, 65, 66, 89, 90, 91]
+
+
 def build_feature_specs(
     schema: FeatureSchema,
     per_position_vocab_sizes: List[int],
@@ -52,6 +55,17 @@ def load_pair_dense_pairs(pair_dense_pairs_json: str) -> List[List[Any]]:
         with open(pair_dense_pairs_json, 'r', encoding='utf-8') as f:
             return json.load(f)
     return json.loads(pair_dense_pairs_json)
+
+
+def load_aligned_user_int_dense_fids(fids_json: str) -> List[int]:
+    if not fids_json:
+        return DEFAULT_ALIGNED_USER_INT_DENSE_FIDS
+    if os.path.exists(fids_json):
+        with open(fids_json, 'r', encoding='utf-8') as f:
+            values = json.load(f)
+    else:
+        values = json.loads(fids_json)
+    return [int(v) for v in values]
 
 
 def parse_args() -> argparse.Namespace:
@@ -201,6 +215,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--pair_dense_pairs_json', type=str, default='',
                         help='Path to or inline JSON list of [item_fid, domain, side_fid] '
                              'pairs; empty uses built-in P2 v1 pairs')
+    parser.add_argument('--use_aligned_user_int_dense', type=int, default=0, choices=[0, 1],
+                        help='Use same-fid user_dense values to weighted-pool aligned '
+                             'user_int embeddings as a final residual')
+    parser.add_argument('--aligned_user_int_dense_gate_init', type=float, default=0.05,
+                        help='Initial scalar residual gate for --use_aligned_user_int_dense')
+    parser.add_argument('--aligned_user_int_dense_fids_json', type=str, default='',
+                        help='Path to or inline JSON list of aligned fids; empty uses '
+                             'the default A01 fids')
     parser.add_argument('--user_dense_projector_type', type=str, default='flat',
                         choices=['flat', 'grouped'],
                         help='flat keeps the legacy concat projection; grouped uses fid-aware dense branches')
@@ -271,6 +293,8 @@ def parse_args() -> argparse.Namespace:
     args.seq_recent_stats_dim = SEQ_RECENT_STATS_DIM
     args.pair_dense_pairs = load_pair_dense_pairs(args.pair_dense_pairs_json)
     args.pair_dense_dim = len(args.pair_dense_pairs) * PAIR_DENSE_FEATS_PER_PAIR
+    args.aligned_user_int_dense_fids = load_aligned_user_int_dense_fids(
+        args.aligned_user_int_dense_fids_json)
 
     # Environment variables take precedence.
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
@@ -307,6 +331,12 @@ def main() -> None:
         f"pair_dense_dim={args.pair_dense_dim}, "
         f"pair_dense_gate_init={args.pair_dense_gate_init}, "
         f"pair_dense_pairs={args.pair_dense_pairs}"
+    )
+    logging.info(
+        "Effective aligned_user_int_dense config: "
+        f"use_aligned_user_int_dense={args.use_aligned_user_int_dense}, "
+        f"aligned_user_int_dense_gate_init={args.aligned_user_int_dense_gate_init}, "
+        f"aligned_user_int_dense_fids={args.aligned_user_int_dense_fids}"
     )
 
     # ---- Data loading ----
@@ -370,6 +400,7 @@ def main() -> None:
         "item_int_feature_specs": item_int_feature_specs,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
+        "user_int_feature_fids": pcvr_dataset.user_int_schema.feature_ids(),
         "user_dense_feature_specs": pcvr_dataset.user_dense_schema.entries,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
@@ -398,6 +429,9 @@ def main() -> None:
         "use_pair_dense": bool(args.use_pair_dense),
         "pair_dense_dim": args.pair_dense_dim,
         "pair_dense_gate_init": args.pair_dense_gate_init,
+        "use_aligned_user_int_dense": bool(args.use_aligned_user_int_dense),
+        "aligned_user_int_dense_gate_init": args.aligned_user_int_dense_gate_init,
+        "aligned_user_int_dense_fids": args.aligned_user_int_dense_fids,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
         "ns_tokenizer_type": args.ns_tokenizer_type,

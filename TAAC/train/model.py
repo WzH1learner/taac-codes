@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Any, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -1323,6 +1323,71 @@ class PairDenseProjector(nn.Module):
         return self.net(x)
 
 
+class AlignedUserIntDenseProjector(nn.Module):
+    """Pool aligned user_int embeddings with same-fid user_dense weights."""
+
+    STATS_FIDS = {62, 63, 64, 65, 66}
+
+    def __init__(
+        self,
+        d_model: int,
+        emb_dim: int,
+        aligned_specs: List[Dict[str, Any]],
+        hidden_mult: int = 2,
+        weight_clip: float = 20.0,
+    ) -> None:
+        super().__init__()
+        self.aligned_specs = aligned_specs
+        self.weight_clip = float(weight_clip)
+        self.weight_norms = nn.ModuleDict()
+        for spec in aligned_specs:
+            if int(spec["length"]) > 1:
+                self.weight_norms[str(spec["fid"])] = nn.LayerNorm(int(spec["length"]))
+        self.input_proj = (
+            nn.Identity() if emb_dim == d_model else nn.Linear(emb_dim, d_model)
+        )
+        hidden_dim = max(d_model, d_model * hidden_mult)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def _transform_weight(self, weights: torch.Tensor, fid: int) -> torch.Tensor:
+        if fid in self.STATS_FIDS:
+            weights = torch.sign(weights) * torch.log1p(torch.abs(weights))
+        weights = torch.clamp(weights, -self.weight_clip, self.weight_clip)
+        key = str(fid)
+        if key in self.weight_norms:
+            weights = self.weight_norms[key](weights)
+        return weights
+
+    def forward(
+        self,
+        user_int_feats: torch.Tensor,
+        user_dense_feats: torch.Tensor,
+        tokenizer: nn.Module,
+    ) -> torch.Tensor:
+        pooled_vectors = []
+        for spec in self.aligned_specs:
+            fid = int(spec["fid"])
+            length = int(spec["length"])
+            emb_real_idx = int(spec["emb_real_idx"])
+            ids = user_int_feats[:, spec["int_offset"]:spec["int_offset"] + length].long()
+            dense_w = user_dense_feats[:, spec["dense_offset"]:spec["dense_offset"] + length]
+            valid = (ids > 0).to(dense_w.dtype)
+            emb = tokenizer.embs[emb_real_idx](ids)
+            weights = self._transform_weight(dense_w, fid) * valid
+            count = valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+            pooled = (emb * weights.unsqueeze(-1)).sum(dim=1) / count
+            pooled_vectors.append(self.input_proj(pooled))
+        if not pooled_vectors:
+            return user_dense_feats.new_zeros(user_dense_feats.shape[0], self.mlp[-1].normalized_shape[0])
+        return self.mlp(torch.stack(pooled_vectors, dim=1).mean(dim=1))
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1341,6 +1406,7 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        user_int_feature_fids: Optional[List[int]] = None,
         user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
         # Model hyperparameters
         d_model: int = 64,
@@ -1367,6 +1433,9 @@ class PCVRHyFormer(nn.Module):
         use_pair_dense: Union[bool, int] = False,
         pair_dense_dim: int = 49,
         pair_dense_gate_init: float = 0.05,
+        use_aligned_user_int_dense: Union[bool, int] = False,
+        aligned_user_int_dense_gate_init: float = 0.05,
+        aligned_user_int_dense_fids: Optional[List[int]] = None,
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
         # NS tokenizer variant
@@ -1393,6 +1462,7 @@ class PCVRHyFormer(nn.Module):
         self.seq_recent_stats_dim = int(seq_recent_stats_dim)
         self.use_pair_dense = bool(use_pair_dense)
         self.pair_dense_dim = int(pair_dense_dim)
+        self.use_aligned_user_int_dense = bool(use_aligned_user_int_dense)
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
@@ -1471,6 +1541,79 @@ class PCVRHyFormer(nn.Module):
                     input_dim=self.time_context_dim,
                     d_model=d_model,
                 )
+
+        self.aligned_user_int_dense_specs: List[Dict[str, Any]] = []
+        if self.use_aligned_user_int_dense:
+            aligned_fids = [
+                int(fid) for fid in (
+                    aligned_user_int_dense_fids
+                    if aligned_user_int_dense_fids is not None
+                    else [62, 63, 64, 65, 66, 89, 90, 91]
+                )
+            ]
+            int_fid_to_idx = {
+                int(fid): idx for idx, fid in enumerate(user_int_feature_fids or [])
+            }
+            dense_fid_to_spec = {
+                int(fid): (int(offset), int(length))
+                for fid, offset, length in (user_dense_feature_specs or [])
+            }
+            for fid in aligned_fids:
+                if fid not in int_fid_to_idx:
+                    logging.warning("aligned_user_int_dense: user_int fid=%s missing; skipped", fid)
+                    continue
+                if fid not in dense_fid_to_spec:
+                    logging.warning("aligned_user_int_dense: user_dense fid=%s missing; skipped", fid)
+                    continue
+                int_idx = int_fid_to_idx[fid]
+                vs, int_offset, int_length = user_int_feature_specs[int_idx]
+                emb_real_idx = self.user_ns_tokenizer._emb_index[int_idx]
+                if emb_real_idx == -1:
+                    logging.warning(
+                        "aligned_user_int_dense: fid=%s embedding skipped by vocab filter; skipped", fid)
+                    continue
+                dense_offset, dense_length = dense_fid_to_spec[fid]
+                use_length = min(int(int_length), int(dense_length))
+                if use_length <= 0:
+                    logging.warning("aligned_user_int_dense: fid=%s has no usable aligned dim; skipped", fid)
+                    continue
+                if int(int_length) != int(dense_length):
+                    logging.warning(
+                        "aligned_user_int_dense: fid=%s int_len=%d dense_len=%d; using first %d positions",
+                        fid,
+                        int(int_length),
+                        int(dense_length),
+                        use_length,
+                    )
+                self.aligned_user_int_dense_specs.append({
+                    "fid": fid,
+                    "int_offset": int(int_offset),
+                    "dense_offset": int(dense_offset),
+                    "length": use_length,
+                    "emb_real_idx": int(emb_real_idx),
+                    "vocab_size": int(vs),
+                })
+            if self.aligned_user_int_dense_specs:
+                self.aligned_user_int_dense_proj = AlignedUserIntDenseProjector(
+                    d_model=d_model,
+                    emb_dim=emb_dim,
+                    aligned_specs=self.aligned_user_int_dense_specs,
+                )
+                self.aligned_user_int_dense_gate = nn.Parameter(
+                    torch.tensor(float(aligned_user_int_dense_gate_init), dtype=torch.float32))
+                logging.info(
+                    "aligned_user_int_dense enabled: fids=%s, active=%s, gate_init=%.4f",
+                    aligned_fids,
+                    [spec["fid"] for spec in self.aligned_user_int_dense_specs],
+                    float(aligned_user_int_dense_gate_init),
+                )
+            else:
+                logging.warning(
+                    "aligned_user_int_dense requested but no usable aligned fids were found; "
+                    "residual disabled")
+                self.use_aligned_user_int_dense = False
+        else:
+            logging.info("aligned_user_int_dense disabled")
 
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
@@ -1873,6 +2016,24 @@ class PCVRHyFormer(nn.Module):
         )
         return final_repr + self.pair_dense_gate.to(final_repr.dtype) * self.pair_dense_proj(feats)
 
+    def _apply_aligned_user_int_dense(
+        self,
+        final_repr: torch.Tensor,
+        inputs: ModelInput,
+    ) -> torch.Tensor:
+        if not self.use_aligned_user_int_dense:
+            return final_repr
+        aligned_repr = self.aligned_user_int_dense_proj(
+            inputs.user_int_feats,
+            inputs.user_dense_feats.to(dtype=final_repr.dtype),
+            self.user_ns_tokenizer,
+        )
+        aligned_repr = aligned_repr.to(device=final_repr.device, dtype=final_repr.dtype)
+        return (
+            final_repr
+            + self.aligned_user_int_dense_gate.to(final_repr.dtype) * aligned_repr
+        )
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -1913,6 +2074,7 @@ class PCVRHyFormer(nn.Module):
         )
         output = self._apply_seq_recent_stats(output, inputs)
         output = self._apply_pair_dense(output, inputs)
+        output = self._apply_aligned_user_int_dense(output, inputs)
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -1955,6 +2117,7 @@ class PCVRHyFormer(nn.Module):
         )
         output = self._apply_seq_recent_stats(output, inputs)
         output = self._apply_pair_dense(output, inputs)
+        output = self._apply_aligned_user_int_dense(output, inputs)
 
         logits = self.clsfier(output)
         return logits, output
