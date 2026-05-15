@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Any, List, NamedTuple, Tuple, Optional, Union
+from typing import Any, Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
