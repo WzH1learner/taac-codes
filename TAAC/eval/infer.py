@@ -392,7 +392,7 @@ def build_model(
         item_int_feature_specs=item_int_feature_specs,
         user_dense_dim=dataset.user_dense_schema.total_dim,
         item_dense_dim=dataset.item_dense_schema.total_dim,
-        user_int_feature_fids=dataset.user_int_schema.feature_ids(),
+        user_int_feature_fids=dataset.user_int_schema.feature_ids,
         user_dense_feature_specs=dataset.user_dense_schema.entries,
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,

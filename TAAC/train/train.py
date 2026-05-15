@@ -400,7 +400,7 @@ def main() -> None:
         "item_int_feature_specs": item_int_feature_specs,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
-        "user_int_feature_fids": pcvr_dataset.user_int_schema.feature_ids(),
+        "user_int_feature_fids": pcvr_dataset.user_int_schema.feature_ids,
         "user_dense_feature_specs": pcvr_dataset.user_dense_schema.entries,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
