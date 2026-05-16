@@ -41,7 +41,7 @@ Metric examples from recent runs:
 | Run | Valid AUC | LogLoss | Brier | prob_mean / label_mean | prob_std | Diagnostic read |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | D01 current best | `0.864399` | `0.224305` | `0.064283` | `0.093914 / 0.096785` | `0.164718` | Best verified ranking; calibration acceptable. |
-| emb_skip 5w/2w offline candidate | `0.864382` | `0.222173` | `0.063951` | `0.098231 / 0.096785` | `0.155530` | Near-tie AUC with better calibration; do not discard solely because AUC is tiny lower. |
+| emb_skip 2w | `0.864158` | `0.222410` | `0.064064` | `0.098332 / 0.096785` | `0.156216` | Better calibration did not transfer; official `0.808294`, reject. |
 | P2 current attempt | `0.863351` | `0.223793` | `0.064284` | `0.087573 / 0.096785` | `0.146727` | Too conservative; current P2 residual is not strong, but pair/time EDA signal remains worth redesigning. |
 | G01 group tokenizer | `0.861724` | `0.225285` | `0.064594` | `0.083881 / 0.096785` | `0.143048` | Lower AUC and underprediction; not a mainline without redesign. |
 
@@ -54,12 +54,26 @@ lift, and train-tail stability.
 Time signal EDA command:
 
 ```bash
-python research/code/time_signal_eda.py \
+mkdir -p "${TRAIN_CKPT_PATH:-research/reports}"
+python3 -u research/code/time_signal_eda.py \
   --data_path "${TRAIN_DATA_PATH:-/data_ams/academic_training_data}" \
-  --max_files 10 \
-  --max_rows 50000 \
+  --max_files 1000 \
+  --max_rows 200000 \
+  --recursive_files 1 \
+  --write_csv 1 \
+  --summary_top_k 30 \
   --split_by_valid_tail 1 \
-  --output "${TRAIN_CKPT_PATH:-research/reports}/time_signal_eda.md"
+  --output "${TRAIN_CKPT_PATH:-research/reports}/time_signal_eda.md" \
+  2>&1 | tee "${TRAIN_CKPT_PATH:-research/reports}/time_signal_eda.log"
+```
+
+Cloud-log friendly printout:
+
+```bash
+REPORT="${TRAIN_CKPT_PATH:-research/reports}/time_signal_eda.md"
+awk '/^## Compact Summary/{flag=1} /^## Global Domain Recency Lift/{flag=0} flag{print}' "$REPORT"
+awk '/^## Target-Matched Recency Lift/{flag=1; n=0} /^## Target-Matched Recency Stability/{flag=0} flag && n++ < 65{print}' "$REPORT"
+awk '/^## Target-Matched Recency Stability/{flag=1; n=0} /^## How To Use This Report/{flag=0} flag && n++ < 45{print}' "$REPORT"
 ```
 
 Smoke first if needed:
@@ -95,6 +109,7 @@ python research/code/time_signal_eda.py \
 | D02_grouped_dense_swiglu_clean | D01 + `seq_encoder_type=swiglu` | TBD | `0.864255` | `0.223297` | `0.814760` | Rejected as mainline. SwiGLU + grouped dense underperforms D01 official. |
 | R01_seq_recent_stats_residual_v1 | D01 + `use_seq_recent_stats=1`, gate `0.1` | TBD | TBD | TBD | `0.808144` | Rejected. Global recency stats do not transfer to official eval. |
 | G01_group_tokenizer | Group tokenizer candidate | TBD | `0.8617` | TBD | TBD | Keep as possible G02 candidate, but not the mainline. |
+| D01_emb_skip_2w | D01 with lower embedding skip threshold | 6 | `0.864158` | `0.222410` | `0.808294` | Rejected by official eval. Do not continue this line. |
 
 ## Active Direction
 
@@ -189,17 +204,41 @@ Note: many top-lift pairs have tiny match counts. P2 v1 must use only pairs with
 ## Pair EDA v2 Command
 
 ```bash
-python research/code/pair_match_eda.py \
+mkdir -p "${TRAIN_CKPT_PATH:-research/reports}"
+python3 -u research/code/pair_match_eda.py \
   --data_path "${TRAIN_DATA_PATH:-/data_ams/academic_training_data}" \
-  --max_files 10 \
-  --max_rows 50000 \
+  --max_files 1000 \
+  --max_rows 200000 \
+  --recursive_files 1 \
+  --write_csv 1 \
+  --summary_top_k 30 \
   --min_match_count 50 \
   --min_recent_match_count 10 \
   --top_k 50 \
   --focus_domain seq_d \
   --focus_side_fid 25 \
   --split_by_valid_tail 1 \
-  --output "${TRAIN_CKPT_PATH}/pair_match_eda_v2.md"
+  --output "${TRAIN_CKPT_PATH:-research/reports}/pair_match_eda_v2.md" \
+  2>&1 | tee "${TRAIN_CKPT_PATH:-research/reports}/pair_match_eda_v2.log"
+```
+
+Cloud-log friendly printout:
+
+```bash
+REPORT="${TRAIN_CKPT_PATH:-research/reports}/pair_match_eda_v2.md"
+awk '/^## Compact Summary/{flag=1} /^## Schema Candidates/{flag=0} flag{print}' "$REPORT"
+awk '/^## Stable Candidate Pairs/{flag=1; n=0} /^## Unstable High-Lift/{flag=0} flag && n++ < 45{print}' "$REPORT"
+awk '/^## Focus Table/{flag=1; n=0} /^## Top Pairs By Lift/{flag=0} flag && n++ < 45{print}' "$REPORT"
+awk '/^## First 90% vs Tail 10% Stability/{flag=1; n=0} /^## Recommendations/{flag=0} flag && n++ < 45{print}' "$REPORT"
+```
+
+CSV outputs:
+
+```text
+pair_match_all.csv
+pair_match_stable.csv
+pair_match_focus.csv
+pair_match_stability.csv
 ```
 
 ## P2_pair_dense_v1 Draft

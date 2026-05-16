@@ -8,6 +8,7 @@ enough to train.
 """
 
 import argparse
+import csv
 import glob
 import json
 import math
@@ -158,8 +159,22 @@ def _markdown_table(rows: Sequence[Dict[str, Any]], cols: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
-def _iter_parquet_files(data_path: str, max_files: int) -> List[str]:
-    return sorted(glob.glob(os.path.join(data_path, "*.parquet")))[:max_files]
+def _write_csv(path: str, rows: Sequence[Dict[str, Any]], cols: Sequence[str]) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(cols), extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({c: row.get(c, "") for c in cols})
+
+
+def _iter_parquet_files(data_path: str, max_files: int, recursive_files: int) -> List[str]:
+    direct = sorted(glob.glob(os.path.join(data_path, "*.parquet")))
+    files = list(direct)
+    if recursive_files and len(files) < max_files:
+        seen = set(files)
+        recursive = sorted(glob.glob(os.path.join(data_path, "**", "*.parquet"), recursive=True))
+        files.extend([p for p in recursive if p not in seen])
+    return files[:max_files]
 
 
 def _schema_candidates(schema: Dict[str, Any]) -> Tuple[List[int], Dict[str, Dict[str, Any]]]:
@@ -192,6 +207,7 @@ def _scan_rows(
     seq_info: Dict[str, Dict[str, Any]],
     max_rows: int,
     include_label: bool,
+    recursive_files: int,
 ) -> List[Dict[str, Any]]:
     needed_cols = ["timestamp"]
     if include_label:
@@ -207,7 +223,9 @@ def _scan_rows(
             needed_cols.append(f"{prefix}_{fid}")
 
     rows: List[Dict[str, Any]] = []
+    last_progress = 0
     for file_path in parquet_files:
+        print(f"[pair_match_eda] reading {file_path}", flush=True)
         pf = pq.ParquetFile(file_path)
         available = set(pf.schema_arrow.names)
         columns = [c for c in needed_cols if c in available]
@@ -241,6 +259,9 @@ def _scan_rows(
                             f"{prefix}_{side_fid}", [None] * take_n)[i]
                     row["seq"][domain] = domain_row
                 rows.append(row)
+                if len(rows) - last_progress >= 5000:
+                    last_progress = len(rows)
+                    print(f"[pair_match_eda] rows_scanned={len(rows)}", flush=True)
             if len(rows) >= max_rows:
                 break
         if len(rows) >= max_rows:
@@ -344,7 +365,8 @@ def run_eda(args: argparse.Namespace) -> None:
         schema = json.load(f)
 
     item_fids, seq_info = _schema_candidates(schema)
-    parquet_files = _iter_parquet_files(args.data_path, args.max_files)
+    parquet_files = _iter_parquet_files(args.data_path, args.max_files, args.recursive_files)
+    print(f"[pair_match_eda] found parquet files={len(parquet_files)}", flush=True)
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files under {args.data_path}")
 
@@ -355,8 +377,11 @@ def run_eda(args: argparse.Namespace) -> None:
         seq_info=seq_info,
         max_rows=args.max_rows,
         include_label=bool(args.include_label),
+        recursive_files=args.recursive_files,
     )
+    print(f"[pair_match_eda] accumulate start rows={len(rows_raw)}", flush=True)
     stats = _accumulate_rows(rows_raw, item_fids, seq_info)
+    print("[pair_match_eda] accumulate end", flush=True)
     rows = _rows_from_stats(stats)
     rows_by_lift = _sort_by_lift(rows)
     rows_by_match = sorted(rows, key=lambda r: r["match_any_rate"], reverse=True)
@@ -380,8 +405,42 @@ def run_eda(args: argparse.Namespace) -> None:
         "matched_last_gap_mean", "matched_last_gap_p50", "matched_last_gap_p90",
         "positive_rate_when_match", "positive_rate_when_no_match", "lift",
     ]
+    rejected_high_coverage_negative = [
+        r for r in rows
+        if r["match_count_abs"] >= args.min_match_count
+        and r["match_any_rate"] >= 0.05
+        and math.isfinite(r["lift"])
+        and r["lift"] < 1.0
+    ]
+    rejected_high_coverage_negative = sorted(
+        rejected_high_coverage_negative,
+        key=lambda r: (r["match_any_rate"], -r["lift"]),
+        reverse=True,
+    )
+    top_stable_seq_d = [r for r in stable if r["domain"] == "seq_d"]
+
     lines = [
         "# Pair / Target-History Match EDA v2",
+        "",
+        "## Compact Summary",
+        "",
+        f"- rows_scanned: `{len(rows_raw)}`",
+        f"- parquet_files_scanned: `{len(parquet_files)}`",
+        f"- stable_candidate_count: `{len(stable)}`",
+        "",
+        "### Top Stable Pairs",
+        "",
+        _markdown_table(stable[:args.summary_top_k], cols),
+        "",
+        "### Top Stable seq_d Pairs",
+        "",
+        _markdown_table(top_stable_seq_d[:args.summary_top_k], cols),
+        "",
+        "### Rejected High-Coverage Negative-Lift Pairs",
+        "",
+        _markdown_table(rejected_high_coverage_negative[:args.summary_top_k], cols),
+        "",
+        "---",
         "",
         f"- data_path: `{args.data_path}`",
         f"- schema_path: `{schema_path}`",
@@ -432,13 +491,18 @@ def run_eda(args: argparse.Namespace) -> None:
         _markdown_table(rows_by_recent[:args.top_k], cols),
     ])
 
+    stability_rows: List[Dict[str, Any]] = []
+    stability_cols = [
+        "item_fid", "domain", "side_fid", "first90_lift", "tail10_lift",
+        "first90_match_any_rate", "tail10_match_any_rate",
+        "first90_match_count_abs", "tail10_match_count_abs",
+    ]
     if args.split_by_valid_tail:
         split_idx = int(len(rows_raw) * 0.9)
         first_stats = _accumulate_rows(rows_raw[:split_idx], item_fids, seq_info)
         tail_stats = _accumulate_rows(rows_raw[split_idx:], item_fids, seq_info)
         first_rows = {k: v.as_row(*k) for k, v in first_stats.items()}
         tail_rows = {k: v.as_row(*k) for k, v in tail_stats.items()}
-        stability_rows: List[Dict[str, Any]] = []
         for r in stable[:args.top_k]:
             key = (r["item_fid"], r["domain"], r["side_fid"])
             first = first_rows[key]
@@ -454,11 +518,6 @@ def run_eda(args: argparse.Namespace) -> None:
                 "first90_match_count_abs": first["match_count_abs"],
                 "tail10_match_count_abs": tail["match_count_abs"],
             })
-        stability_cols = [
-            "item_fid", "domain", "side_fid", "first90_lift", "tail10_lift",
-            "first90_match_any_rate", "tail10_match_any_rate",
-            "first90_match_count_abs", "tail10_match_count_abs",
-        ]
         lines.extend([
             "",
             "## First 90% vs Tail 10% Stability",
@@ -476,9 +535,15 @@ def run_eda(args: argparse.Namespace) -> None:
         "- This script does not train or modify model inputs.",
     ])
 
+    print("[pair_match_eda] write report start", flush=True)
+    if args.write_csv:
+        _write_csv(os.path.join(out_dir or ".", "pair_match_all.csv"), rows, cols)
+        _write_csv(os.path.join(out_dir or ".", "pair_match_stable.csv"), stable, cols)
+        _write_csv(os.path.join(out_dir or ".", "pair_match_focus.csv"), focus, cols)
+        _write_csv(os.path.join(out_dir or ".", "pair_match_stability.csv"), stability_rows, stability_cols)
     with open(args.output, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"Wrote {args.output}")
+    print(f"[pair_match_eda] write report end output={args.output}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -490,6 +555,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_rows", type=int, default=50000)
     parser.add_argument("--output", type=str, default="research/reports/pair_match_eda.md")
     parser.add_argument("--include_label", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--recursive_files", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--write_csv", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--summary_top_k", type=int, default=30)
     parser.add_argument("--min_match_count", type=int, default=50)
     parser.add_argument("--min_recent_match_count", type=int, default=10)
     parser.add_argument("--top_k", type=int, default=50)

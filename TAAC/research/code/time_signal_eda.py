@@ -8,6 +8,7 @@ a future P3_target_matched_recency feature.
 """
 
 import argparse
+import csv
 import glob
 import json
 import math
@@ -20,12 +21,12 @@ import pyarrow.parquet as pq
 
 
 DEFAULT_FOCUS_PAIRS: List[List[Any]] = [
+    [12, "seq_d", 25],
     [13, "seq_d", 25],
-    [81, "seq_d", 25],
     [9, "seq_d", 25],
     [5, "seq_d", 25],
     [83, "seq_d", 25],
-    [10, "seq_d", 25],
+    [81, "seq_d", 25],
     [6, "seq_d", 24],
 ]
 
@@ -102,6 +103,14 @@ def _markdown_table(rows: Sequence[Dict[str, Any]], cols: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
+def _write_csv(path: str, rows: Sequence[Dict[str, Any]], cols: Sequence[str]) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(cols), extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({c: row.get(c, "") for c in cols})
+
+
 def _int_values(value: Any) -> List[int]:
     if value is None:
         return []
@@ -147,10 +156,13 @@ def _parse_pairs(raw: str) -> List[List[Any]]:
     return out
 
 
-def _iter_parquet_files(data_path: str, max_files: int) -> List[str]:
-    files = sorted(glob.glob(os.path.join(data_path, "*.parquet")))
-    if not files:
-        files = sorted(glob.glob(os.path.join(data_path, "**", "*.parquet"), recursive=True))
+def _iter_parquet_files(data_path: str, max_files: int, recursive_files: int) -> List[str]:
+    direct = sorted(glob.glob(os.path.join(data_path, "*.parquet")))
+    files = list(direct)
+    if recursive_files and len(files) < max_files:
+        seen = set(files)
+        recursive = sorted(glob.glob(os.path.join(data_path, "**", "*.parquet"), recursive=True))
+        files.extend([p for p in recursive if p not in seen])
     return files[:max_files]
 
 
@@ -171,6 +183,7 @@ def _scan_rows(
     max_files: int,
     max_rows: int,
     include_label: bool,
+    recursive_files: int,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     seq_info = _schema_seq_info(schema)
     needed_cols = ["timestamp"]
@@ -191,8 +204,11 @@ def _scan_rows(
             needed_cols.append(f"{prefix}_{ts_fid}")
 
     rows: List[Dict[str, Any]] = []
-    files = _iter_parquet_files(data_path, max_files)
+    files = _iter_parquet_files(data_path, max_files, recursive_files)
+    print(f"[time_signal_eda] found parquet files={len(files)}", flush=True)
+    last_progress = 0
     for file_path in files:
+        print(f"[time_signal_eda] reading {file_path}", flush=True)
         pf = pq.ParquetFile(file_path)
         available = set(pf.schema_arrow.names)
         columns = [c for c in sorted(set(needed_cols)) if c in available]
@@ -213,6 +229,9 @@ def _scan_rows(
                     "cols": {name: col_values[name][i] for name in columns if name not in {"timestamp", "label_type"}},
                 }
                 rows.append(row)
+                if len(rows) - last_progress >= 5000:
+                    last_progress = len(rows)
+                    print(f"[time_signal_eda] rows_scanned={len(rows)}", flush=True)
             if len(rows) >= max_rows:
                 break
         if len(rows) >= max_rows:
@@ -357,8 +376,11 @@ def run_eda(args: argparse.Namespace) -> None:
         args.max_files,
         args.max_rows,
         bool(args.include_label),
+        args.recursive_files,
     )
+    print(f"[time_signal_eda] accumulate start rows={len(rows)}", flush=True)
     global_rows, pair_rows, meta = _accumulate(rows, schema, pairs)
+    print("[time_signal_eda] accumulate end", flush=True)
 
     out_dir = os.path.dirname(args.output)
     if out_dir:
@@ -373,8 +395,52 @@ def run_eda(args: argparse.Namespace) -> None:
         "true_rate", "positive_rate_when_true", "positive_rate_when_false", "lift",
     ]
 
+    sorted_global = _sort_signal(global_rows)
+    sorted_pair = _sort_signal(pair_rows)
+    stable_pair_candidates = [
+        r for r in sorted_pair
+        if r["true_count"] >= 10
+        and r["true_rate"] >= 0.005
+        and math.isfinite(r["lift"])
+        and r["lift"] > 1.05
+        and r["positive_rate_when_true"] > r["positive_rate_when_false"]
+    ]
+    recommended = [
+        {
+            "item_fid": r["item_fid"],
+            "domain": r["domain"],
+            "side_fid": r["side_fid"],
+            "window": r["window"],
+            "lift": r["lift"],
+            "true_rate": r["true_rate"],
+            "true_count": r["true_count"],
+        }
+        for r in stable_pair_candidates[:args.summary_top_k]
+    ]
+    rec_cols = ["item_fid", "domain", "side_fid", "window", "lift", "true_rate", "true_count"]
+
     lines = [
         "# Time / Target-Matched Recency EDA",
+        "",
+        "## Compact Summary",
+        "",
+        f"- rows_scanned: `{len(rows)}`",
+        f"- parquet_files_scanned: `{len(files)}`",
+        f"- future_or_invalid_ts_rate: `{meta['future_or_invalid_ts_rate']:.6f}`",
+        "",
+        "### Global Recency Top Signals",
+        "",
+        _markdown_table(sorted_global[:args.summary_top_k], global_cols),
+        "",
+        "### Target-Matched Recency Stable Candidates",
+        "",
+        _markdown_table(stable_pair_candidates[:args.summary_top_k], pair_cols),
+        "",
+        "### Recommended P3 Pairs / Windows",
+        "",
+        _markdown_table(recommended, rec_cols),
+        "",
+        "---",
         "",
         f"- data_path: `{args.data_path}`",
         f"- schema_path: `{schema_path}`",
@@ -388,15 +454,20 @@ def run_eda(args: argparse.Namespace) -> None:
         "",
         "This is the R01-style risk area. Strong global lift is useful only if it is stable and not driven by root-time drift.",
         "",
-        _markdown_table(_sort_signal(global_rows), global_cols),
+        _markdown_table(sorted_global, global_cols),
         "",
         "## Target-Matched Recency Lift",
         "",
         "This is the preferred next time direction: recency conditioned on target-history exact match.",
         "",
-        _markdown_table(_sort_signal(pair_rows)[:args.top_k], pair_cols),
+        _markdown_table(sorted_pair[:args.top_k], pair_cols),
     ]
 
+    stability: List[Dict[str, Any]] = []
+    stability_cols = [
+        "item_fid", "domain", "side_fid", "window", "full_lift",
+        "first90_lift", "tail10_lift", "full_true_rate", "tail10_true_rate",
+    ]
     if args.split_by_valid_tail:
         split_idx = int(len(rows) * 0.9)
         global_first, pair_first, _ = _accumulate(rows[:split_idx], schema, pairs)
@@ -409,8 +480,7 @@ def run_eda(args: argparse.Namespace) -> None:
             (r.get("item_fid"), r.get("domain"), r.get("side_fid"), r.get("window")): r
             for r in pair_tail
         }
-        stability: List[Dict[str, Any]] = []
-        for r in _sort_signal(pair_rows)[:args.top_k]:
+        for r in sorted_pair[:args.top_k]:
             key = (r.get("item_fid"), r.get("domain"), r.get("side_fid"), r.get("window"))
             first = first_map.get(key, {})
             tail = tail_map.get(key, {})
@@ -425,10 +495,6 @@ def run_eda(args: argparse.Namespace) -> None:
                 "full_true_rate": r.get("true_rate"),
                 "tail10_true_rate": tail.get("true_rate", math.nan),
             })
-        stability_cols = [
-            "item_fid", "domain", "side_fid", "window", "full_lift",
-            "first90_lift", "tail10_lift", "full_true_rate", "tail10_true_rate",
-        ]
         lines.extend([
             "",
             "## Target-Matched Recency Stability: First 90% vs Tail 10%",
@@ -446,9 +512,14 @@ def run_eda(args: argparse.Namespace) -> None:
         "- This script is EDA only and does not change model features.",
     ])
 
+    print("[time_signal_eda] write report start", flush=True)
+    if args.write_csv:
+        _write_csv(os.path.join(out_dir or ".", "time_global_recency.csv"), sorted_global, global_cols)
+        _write_csv(os.path.join(out_dir or ".", "time_target_matched_recency.csv"), sorted_pair, pair_cols)
+        _write_csv(os.path.join(out_dir or ".", "time_target_matched_stability.csv"), stability, stability_cols)
     with open(args.output, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"Wrote {args.output}")
+    print(f"[time_signal_eda] write report end output={args.output}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -462,6 +533,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--focus_pairs_json", default="")
     parser.add_argument("--split_by_valid_tail", type=int, default=1, choices=[0, 1])
     parser.add_argument("--top_k", type=int, default=80)
+    parser.add_argument("--recursive_files", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--write_csv", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--summary_top_k", type=int, default=30)
     parser.add_argument("--output", default="research/reports/time_signal_eda.md")
     return parser.parse_args()
 
