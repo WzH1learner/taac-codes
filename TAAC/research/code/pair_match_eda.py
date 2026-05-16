@@ -114,6 +114,23 @@ def _positive_values(value: Any) -> List[int]:
     return [xi] if xi > 0 else []
 
 
+def _int_values(value: Any) -> List[int]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        out: List[int] = []
+        for x in value:
+            try:
+                out.append(int(x) if x is not None else 0)
+            except (TypeError, ValueError):
+                out.append(0)
+        return out
+    try:
+        return [int(value)]
+    except (TypeError, ValueError):
+        return []
+
+
 def _safe_label(value: Any) -> Optional[int]:
     if value is None:
         return None
@@ -245,8 +262,7 @@ def _accumulate_rows(
         label = row["label"]
         for domain, info in seq_info.items():
             seq_row = row["seq"][domain]
-            seq_ts = _positive_values(seq_row["ts"])
-            gaps = [max(root - t, 0) for t in seq_ts]
+            seq_ts = _int_values(seq_row["ts"])
             for item_fid in item_fids:
                 target_values = set(_positive_values(row["item"][item_fid]))
                 if not target_values:
@@ -254,19 +270,25 @@ def _accumulate_rows(
                         stats[(item_fid, domain, side_fid)].update(False, 0, 0, None, label)
                     continue
                 for side_fid in info["side_fids"]:
-                    seq_values = _positive_values(seq_row["side"][side_fid])
+                    seq_values = _int_values(seq_row["side"][side_fid])
                     match_gaps: List[int] = []
                     match_count = 0
                     recent_count = 0
                     for pos, value in enumerate(seq_values):
+                        if value <= 0 or pos >= len(seq_ts):
+                            continue
+                        ts = seq_ts[pos]
+                        if ts <= 0 or ts > root:
+                            continue
                         if value not in target_values:
                             continue
+                        gap = root - ts
+                        if gap < 0:
+                            continue
                         match_count += 1
-                        gap = gaps[pos] if pos < len(gaps) else math.inf
-                        if math.isfinite(gap):
-                            match_gaps.append(int(gap))
-                            if gap <= 7200:
-                                recent_count += 1
+                        match_gaps.append(int(gap))
+                        if gap <= 7200:
+                            recent_count += 1
                     stats[(item_fid, domain, side_fid)].update(
                         match_count > 0,
                         match_count,

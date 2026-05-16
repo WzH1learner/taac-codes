@@ -3,6 +3,76 @@
 Official eval AUC is the decision metric. Validation AUC, LogLoss, Brier, and
 prob_mean/label_mean are candidate filters only.
 
+## Metric Review Principle - 2026-05-16
+
+Near the preliminary deadline, the goal is not just to run more ideas; it is to
+turn each run into sharper decisions that can improve official eval AUC. Official
+eval AUC remains the final scoreboard, but training logs are useful diagnostics.
+Do not judge an experiment by valid AUC alone, and do not discard every failed
+official run without reading what its metrics taught us.
+
+How to read the main validation metrics:
+
+| Metric | What it tells us | How to use it |
+| --- | --- | --- |
+| `valid AUC` | Ranking/separation quality on the local split. | Main filter for whether a checkpoint deserves official eval. |
+| `LogLoss` | Probability quality and confidence penalty. | If AUC is near D01 but LogLoss is clearly better, keep the direction as a candidate. |
+| `Brier` | Calibration and squared probability error. | Useful together with LogLoss; lower means probabilities are less distorted. |
+| `prob_mean / label_mean` | Base-rate calibration. | `prob_mean` far below label rate means conservative underprediction; far above means overprediction. |
+| `prob_std` and `logit_std` | Output spread/confidence. | Higher can mean better separation inside one run, but it is not universally better across different model families. |
+
+Important rule for `prob_std`: within D01, `prob_std` rose together with valid
+AUC, so it behaved like a separation signal. Across other experiments this did
+not hold. High `prob_std` with worse LogLoss can mean confidently wrong scores;
+low `prob_std` with low `prob_mean` can mean the model is too conservative.
+
+Candidate decision rule:
+
+```text
+1. Official eval AUC decides the leaderboard.
+2. Valid AUC decides whether an experiment deserves official eval budget.
+3. LogLoss/Brier/prob_mean decide whether a near-tie is worth keeping.
+4. Failed official experiments still teach what to reject or redesign.
+5. For time/pair/history ideas, run EDA first, then train a single-variable model.
+```
+
+Metric examples from recent runs:
+
+| Run | Valid AUC | LogLoss | Brier | prob_mean / label_mean | prob_std | Diagnostic read |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| D01 current best | `0.864399` | `0.224305` | `0.064283` | `0.093914 / 0.096785` | `0.164718` | Best verified ranking; calibration acceptable. |
+| emb_skip 5w/2w offline candidate | `0.864382` | `0.222173` | `0.063951` | `0.098231 / 0.096785` | `0.155530` | Near-tie AUC with better calibration; do not discard solely because AUC is tiny lower. |
+| P2 current attempt | `0.863351` | `0.223793` | `0.064284` | `0.087573 / 0.096785` | `0.146727` | Too conservative; current P2 residual is not strong, but pair/time EDA signal remains worth redesigning. |
+| G01 group tokenizer | `0.861724` | `0.225285` | `0.064594` | `0.083881 / 0.096785` | `0.143048` | Lower AUC and underprediction; not a mainline without redesign. |
+
+Time-feature lesson: T01 and R01 failed official eval, so root/global time and
+global recency are rejected as implemented. This does not mean all time signals
+are useless. Next time-related attempts must start from EDA and focus on
+target-conditioned history signals, such as matched recency, per-domain gap
+lift, and train-tail stability.
+
+Time signal EDA command:
+
+```bash
+python research/code/time_signal_eda.py \
+  --data_path "${TRAIN_DATA_PATH:-/data_ams/academic_training_data}" \
+  --max_files 10 \
+  --max_rows 50000 \
+  --split_by_valid_tail 1 \
+  --output "${TRAIN_CKPT_PATH:-research/reports}/time_signal_eda.md"
+```
+
+Smoke first if needed:
+
+```bash
+python research/code/time_signal_eda.py \
+  --data_path "${TRAIN_DATA_PATH:-/data_ams/academic_training_data}" \
+  --max_files 3 \
+  --max_rows 10000 \
+  --split_by_valid_tail 1 \
+  --output "${TRAIN_CKPT_PATH:-research/reports}/time_signal_eda_smoke.md"
+```
+
 ## Current Best
 
 | Field | Value |
