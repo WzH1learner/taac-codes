@@ -20,6 +20,7 @@ class ModelInput(NamedTuple):
     time_context: Optional[torch.Tensor] = None  # [B, 2 + num_domains * 3]
     seq_recent_stats: Optional[torch.Tensor] = None  # [B, 4 domains * 7 stats]
     pair_dense_feats: Optional[torch.Tensor] = None  # [B, selected_pairs * 7 stats]
+    target_matched_recency_feats: Optional[torch.Tensor] = None  # [B, P3a any-only feats]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1323,6 +1324,24 @@ class PairDenseProjector(nn.Module):
         return self.net(x)
 
 
+class TargetMatchedRecencyProjector(nn.Module):
+    """Project target-matched recency any features to one residual vector."""
+
+    def __init__(self, input_dim: int, d_model: int, dropout: float = 0.01) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class AlignedUserIntDenseProjector(nn.Module):
     """Pool aligned user_int embeddings with same-fid user_dense weights."""
 
@@ -1436,6 +1455,10 @@ class PCVRHyFormer(nn.Module):
         use_aligned_user_int_dense: Union[bool, int] = False,
         aligned_user_int_dense_gate_init: float = 0.05,
         aligned_user_int_dense_fids: Optional[List[int]] = None,
+        use_target_matched_recency: Union[bool, int] = False,
+        target_matched_recency_dim: int = 32,
+        target_matched_recency_gate_init: float = 0.005,
+        target_matched_recency_feature_mode: str = "any_only",
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
         # NS tokenizer variant
@@ -1463,6 +1486,12 @@ class PCVRHyFormer(nn.Module):
         self.use_pair_dense = bool(use_pair_dense)
         self.pair_dense_dim = int(pair_dense_dim)
         self.use_aligned_user_int_dense = bool(use_aligned_user_int_dense)
+        self.use_target_matched_recency = bool(use_target_matched_recency)
+        self.target_matched_recency_dim = int(target_matched_recency_dim)
+        self.target_matched_recency_feature_mode = str(target_matched_recency_feature_mode)
+        if self.target_matched_recency_feature_mode != "any_only":
+            raise ValueError(
+                "target_matched_recency_feature_mode currently supports only 'any_only'")
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
@@ -1759,6 +1788,27 @@ class PCVRHyFormer(nn.Module):
             )
         else:
             logging.info("pair_dense disabled")
+        if self.use_target_matched_recency and self.target_matched_recency_dim > 0:
+            self.target_matched_recency_proj = TargetMatchedRecencyProjector(
+                input_dim=self.target_matched_recency_dim,
+                d_model=d_model,
+                dropout=dropout_rate,
+            )
+            self.target_matched_recency_gate = nn.Parameter(
+                torch.tensor(float(target_matched_recency_gate_init), dtype=torch.float32))
+            logging.info(
+                "target_matched_recency enabled: dim=%d, gate_init=%.4f, mode=%s",
+                self.target_matched_recency_dim,
+                float(target_matched_recency_gate_init),
+                self.target_matched_recency_feature_mode,
+            )
+        else:
+            if self.use_target_matched_recency:
+                logging.warning(
+                    "target_matched_recency requested but dim=%d; disabled",
+                    self.target_matched_recency_dim)
+                self.use_target_matched_recency = False
+            logging.info("target_matched_recency disabled")
 
         # Dropout
         self.emb_dropout = nn.Dropout(dropout_rate)
@@ -2034,6 +2084,26 @@ class PCVRHyFormer(nn.Module):
             + self.aligned_user_int_dense_gate.to(final_repr.dtype) * aligned_repr
         )
 
+    def _apply_target_matched_recency(
+        self,
+        final_repr: torch.Tensor,
+        inputs: ModelInput,
+    ) -> torch.Tensor:
+        if (
+            not self.use_target_matched_recency
+            or inputs.target_matched_recency_feats is None
+        ):
+            return final_repr
+        feats = inputs.target_matched_recency_feats.to(
+            device=final_repr.device,
+            dtype=final_repr.dtype,
+        )
+        return (
+            final_repr
+            + self.target_matched_recency_gate.to(final_repr.dtype)
+            * self.target_matched_recency_proj(feats)
+        )
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -2075,6 +2145,7 @@ class PCVRHyFormer(nn.Module):
         output = self._apply_seq_recent_stats(output, inputs)
         output = self._apply_pair_dense(output, inputs)
         output = self._apply_aligned_user_int_dense(output, inputs)
+        output = self._apply_target_matched_recency(output, inputs)
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -2118,6 +2189,7 @@ class PCVRHyFormer(nn.Module):
         output = self._apply_seq_recent_stats(output, inputs)
         output = self._apply_pair_dense(output, inputs)
         output = self._apply_aligned_user_int_dense(output, inputs)
+        output = self._apply_target_matched_recency(output, inputs)
 
         logits = self.clsfier(output)
         return logits, output

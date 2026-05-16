@@ -502,6 +502,8 @@ class PCVRHyFormerRankingTrainer:
             time_context=device_batch.get('time_context', None),
             seq_recent_stats=device_batch.get('seq_recent_stats', None),
             pair_dense_feats=device_batch.get('pair_dense_feats', None),
+            target_matched_recency_feats=device_batch.get(
+                'target_matched_recency_feats', None),
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:

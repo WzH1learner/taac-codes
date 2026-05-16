@@ -187,6 +187,29 @@ DEFAULT_PAIR_DENSE_PAIRS: List[List[Any]] = [
 ]
 PAIR_DENSE_FEATS_PER_PAIR = 7
 PAIR_DENSE_DIM = len(DEFAULT_PAIR_DENSE_PAIRS) * PAIR_DENSE_FEATS_PER_PAIR
+TARGET_MATCHED_RECENCY_WINDOWS: Dict[str, int] = {
+    "30m": 1800,
+    "2h": 7200,
+    "6h": 21600,
+    "1d": 86400,
+    "3d": 259200,
+    "7d": 604800,
+    "30d": 2592000,
+}
+DEFAULT_TARGET_MATCHED_RECENCY_PAIRS_WINDOWS: List[Dict[str, Any]] = [
+    {"item_fid": 12, "domain": "seq_d", "side_fid": 25,
+     "windows": ["30m", "2h", "6h", "1d", "3d", "7d", "30d"]},
+    {"item_fid": 6, "domain": "seq_d", "side_fid": 24,
+     "windows": ["30m", "2h", "6h", "1d", "3d", "7d", "30d"]},
+    {"item_fid": 13, "domain": "seq_d", "side_fid": 25,
+     "windows": ["1d", "3d", "7d", "30d"]},
+    {"item_fid": 83, "domain": "seq_d", "side_fid": 25,
+     "windows": ["30m", "2h", "6h", "1d", "3d", "7d", "30d"]},
+    {"item_fid": 9, "domain": "seq_d", "side_fid": 25,
+     "windows": ["30m", "2h", "6h", "1d", "3d", "7d", "30d"]},
+]
+TARGET_MATCHED_RECENCY_DIM = sum(
+    len(spec["windows"]) for spec in DEFAULT_TARGET_MATCHED_RECENCY_PAIRS_WINDOWS)
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -214,6 +237,7 @@ class PCVRParquetDataset(IterableDataset):
         clip_vocab: bool = True,
         is_training: bool = True,
         pair_dense_pairs: Optional[List[List[Any]]] = None,
+        target_matched_recency_pairs_windows: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """
         Args:
@@ -241,6 +265,9 @@ class PCVRParquetDataset(IterableDataset):
                 if False, return an all-zeros label column.
             pair_dense_pairs: optional ``[[item_fid, domain, side_fid], ...]``
                 list for target-history pair features.
+            target_matched_recency_pairs_windows: optional P3a specs of the
+                form ``{"item_fid": int, "domain": str, "side_fid": int,
+                "windows": [str, ...]}``.
         """
         super().__init__()
 
@@ -295,6 +322,13 @@ class PCVRParquetDataset(IterableDataset):
         self.pair_dense_pairs = self._normalize_pair_dense_pairs(pair_dense_pairs)
         self.pair_dense_dim = len(self.pair_dense_pairs) * PAIR_DENSE_FEATS_PER_PAIR
         self._pair_dense_specs_by_domain = self._build_pair_dense_specs()
+        self.target_matched_recency_pairs_windows = (
+            self._normalize_target_matched_recency_pairs_windows(
+                target_matched_recency_pairs_windows))
+        self.target_matched_recency_dim = sum(
+            len(spec["windows"]) for spec in self.target_matched_recency_pairs_windows)
+        self._target_matched_recency_specs_by_domain = (
+            self._build_target_matched_recency_specs())
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
@@ -315,6 +349,11 @@ class PCVRParquetDataset(IterableDataset):
         self._pair_dense_feats_logged = False
         self._pair_dense_future_ts_filtered_count = 0
         self._pair_dense_valid_ts_count = 0
+        self._buf_target_matched_recency_feats = np.zeros(
+            (B, self.target_matched_recency_dim), dtype=np.float32)
+        self._target_matched_recency_feats_logged = False
+        self._target_matched_recency_future_ts_filtered_count = 0
+        self._target_matched_recency_valid_ts_count = 0
         self._buf_seq = {}
         self._buf_seq_tb = {}
         self._buf_seq_td = {}
@@ -798,6 +837,153 @@ class PCVRParquetDataset(IterableDataset):
                     np.log1p(latest_gap) if latest_gap > 0 else 0.0,
                 )
 
+    def _normalize_target_matched_recency_pairs_windows(
+        self,
+        specs: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        raw_specs = DEFAULT_TARGET_MATCHED_RECENCY_PAIRS_WINDOWS if specs is None else specs
+        normalized: List[Dict[str, Any]] = []
+        for spec in raw_specs:
+            item_fid = int(spec["item_fid"])
+            domain = str(spec["domain"])
+            side_fid = int(spec["side_fid"])
+            windows = [str(w) for w in spec.get("windows", [])]
+            for w in windows:
+                if w not in TARGET_MATCHED_RECENCY_WINDOWS:
+                    raise ValueError(
+                        f"unknown target matched recency window {w!r}; "
+                        f"known={sorted(TARGET_MATCHED_RECENCY_WINDOWS)}")
+            normalized.append({
+                "item_fid": item_fid,
+                "domain": domain,
+                "side_fid": side_fid,
+                "windows": windows,
+            })
+        return normalized
+
+    def _build_target_matched_recency_specs(
+        self,
+    ) -> Dict[str, List[Tuple[int, int, int, int, int, int, str, int]]]:
+        item_offsets = {
+            fid: (offset, length)
+            for fid, offset, length in self.item_int_schema.entries
+        }
+        specs_by_domain: Dict[str, List[Tuple[int, int, int, int, int, int, str, int]]] = {}
+        feature_idx = 0
+        active = 0
+        for spec in self.target_matched_recency_pairs_windows:
+            item_fid = int(spec["item_fid"])
+            domain = str(spec["domain"])
+            side_fid = int(spec["side_fid"])
+            windows = list(spec["windows"])
+            if item_fid not in item_offsets:
+                logging.warning(
+                    "target_matched_recency: item_fid=%s missing from schema; "
+                    "%d feature(s) kept zero", item_fid, len(windows))
+                feature_idx += len(windows)
+                continue
+            side_fids = self.sideinfo_fids.get(domain)
+            if not side_fids or side_fid not in side_fids:
+                logging.warning(
+                    "target_matched_recency: %s side_fid=%s missing from schema; "
+                    "%d feature(s) kept zero", domain, side_fid, len(windows))
+                feature_idx += len(windows)
+                continue
+            item_offset, item_len = item_offsets[item_fid]
+            side_slot = side_fids.index(side_fid)
+            for window_name in windows:
+                specs_by_domain.setdefault(domain, []).append((
+                    feature_idx,
+                    item_offset,
+                    item_len,
+                    side_slot,
+                    item_fid,
+                    side_fid,
+                    window_name,
+                    TARGET_MATCHED_RECENCY_WINDOWS[window_name],
+                ))
+                feature_idx += 1
+                active += 1
+        logging.info(
+            "target_matched_recency configured: dim=%d, active_specs=%d, specs=%s",
+            self.target_matched_recency_dim,
+            active,
+            self.target_matched_recency_pairs_windows,
+        )
+        self.target_matched_recency_active_specs = active
+        if self.target_matched_recency_dim > 0 and active == 0:
+            logging.warning(
+                "target_matched_recency requested specs have no usable fields; "
+                "features will remain all zero")
+        return specs_by_domain
+
+    def _maybe_log_target_matched_recency_feats(
+        self,
+        feats: "npt.NDArray[np.float32]",
+    ) -> None:
+        if self._target_matched_recency_feats_logged or feats.size == 0:
+            return
+        preview_dim = min(12, feats.shape[1])
+        head = feats[:, :preview_dim]
+        means = head.mean(axis=0)
+        max_vals = head.max(axis=0)
+        zero_rates = (head == 0).mean(axis=0)
+        logging.info(
+            "target_matched_recency_feats diagnostics: dim=%d, head_mean=%s, "
+            "head_max=%s, head_zero_rate=%s, future_ts_filtered_count=%d, "
+            "future_ts_filtered_rate=%.6f",
+            feats.shape[1],
+            np.array2string(means, precision=4, separator=','),
+            np.array2string(max_vals, precision=4, separator=','),
+            np.array2string(zero_rates, precision=4, separator=','),
+            self._target_matched_recency_future_ts_filtered_count,
+            self._target_matched_recency_future_ts_filtered_count / max(
+                self._target_matched_recency_valid_ts_count, 1),
+        )
+        self._target_matched_recency_feats_logged = True
+
+    def _fill_target_matched_recency_for_domain(
+        self,
+        domain: str,
+        item_int: "npt.NDArray[np.int64]",
+        seq_sideinfo: "npt.NDArray[np.int64]",
+        feats: "npt.NDArray[np.float32]",
+        ts_padded: Optional["npt.NDArray[np.int64]"],
+        root_ts: "npt.NDArray[np.int64]",
+    ) -> None:
+        specs = self._target_matched_recency_specs_by_domain.get(domain)
+        if not specs:
+            return
+        B = item_int.shape[0]
+        L = seq_sideinfo.shape[2]
+        if ts_padded is not None:
+            raw_gap = root_ts.reshape(B, 1) - ts_padded
+            valid_ts = ts_padded > 0
+            historical_valid_mask = valid_ts & (raw_gap >= 0)
+            future_ts_mask = valid_ts & (raw_gap < 0)
+            self._target_matched_recency_future_ts_filtered_count += int(future_ts_mask.sum())
+            self._target_matched_recency_valid_ts_count += int(valid_ts.sum())
+            gap = np.maximum(raw_gap, 0).astype(np.float32)
+        else:
+            historical_valid_mask = np.zeros((B, L), dtype=bool)
+            gap = np.zeros((B, L), dtype=np.float32)
+
+        for feature_idx, item_offset, item_len, side_slot, _item_fid, _side_fid, _window_name, window_sec in specs:
+            side_vals = seq_sideinfo[:, side_slot, :]
+            for i in range(B):
+                targets = item_int[i, item_offset:item_offset + item_len]
+                targets = targets[targets > 0]
+                if targets.size == 0:
+                    continue
+                matches = (
+                    np.isin(side_vals[i], targets)
+                    & (side_vals[i] > 0)
+                    & historical_valid_mask[i]
+                    & (gap[i] <= float(window_sec))
+                )
+                if matches.any():
+                    feats[i, feature_idx] = 1.0
+
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
         """Convert an Arrow RecordBatch into a training-ready dict of tensors."""
         B = batch.num_rows
@@ -887,6 +1073,8 @@ class PCVRParquetDataset(IterableDataset):
         seq_recent_stats[:] = 0.0
         pair_dense_feats = self._buf_pair_dense_feats[:B]
         pair_dense_feats[:] = 0.0
+        target_matched_recency_feats = self._buf_target_matched_recency_feats[:B]
+        target_matched_recency_feats[:] = 0.0
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain_idx, domain in enumerate(self.seq_domains):
@@ -1021,14 +1209,25 @@ class PCVRParquetDataset(IterableDataset):
                 ts_padded,
                 timestamps,
             )
+            self._fill_target_matched_recency_for_domain(
+                domain,
+                item_int,
+                out,
+                target_matched_recency_feats,
+                ts_padded,
+                timestamps,
+            )
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
             result[f'{domain}_time_delta'] = torch.from_numpy(time_delta.copy())
 
         result['time_context'] = torch.from_numpy(time_context.copy())
         result['seq_recent_stats'] = torch.from_numpy(seq_recent_stats.copy())
         result['pair_dense_feats'] = torch.from_numpy(pair_dense_feats.copy())
+        result['target_matched_recency_feats'] = torch.from_numpy(
+            target_matched_recency_feats.copy())
         self._maybe_log_seq_recent_stats(seq_recent_stats)
         self._maybe_log_pair_dense_feats(pair_dense_feats)
+        self._maybe_log_target_matched_recency_feats(target_matched_recency_feats)
         return result
 
 
@@ -1048,6 +1247,7 @@ def get_pcvr_data(
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
     pair_dense_pairs: Optional[List[List[Any]]] = None,
+    target_matched_recency_pairs_windows: Optional[List[Dict[str, Any]]] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -1186,6 +1386,7 @@ def get_pcvr_data(
         timestamp_max=train_timestamp_max,
         clip_vocab=clip_vocab,
         pair_dense_pairs=pair_dense_pairs,
+        target_matched_recency_pairs_windows=target_matched_recency_pairs_windows,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -1211,6 +1412,7 @@ def get_pcvr_data(
         timestamp_max=valid_timestamp_max,
         clip_vocab=clip_vocab,
         pair_dense_pairs=pair_dense_pairs,
+        target_matched_recency_pairs_windows=target_matched_recency_pairs_windows,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

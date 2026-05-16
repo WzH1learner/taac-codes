@@ -76,6 +76,14 @@ awk '/^## Target-Matched Recency Lift/{flag=1; n=0} /^## Target-Matched Recency 
 awk '/^## Target-Matched Recency Stability/{flag=1; n=0} /^## How To Use This Report/{flag=0} flag && n++ < 45{print}' "$REPORT"
 ```
 
+Cloud summary helper:
+
+```bash
+python3 -u research/code/print_eda_report_summary.py \
+  --out_dir "${TRAIN_CKPT_PATH}" \
+  --top_k 120
+```
+
 Smoke first if needed:
 
 ```bash
@@ -115,10 +123,61 @@ python research/code/time_signal_eda.py \
 
 | Direction | Status | Rationale |
 | --- | --- | --- |
+| `P3a_target_matched_recency_any_lite` | Next main candidate | EDA v3 scanned `200000` rows / `1000` files with `future_or_invalid_ts_rate=0`; target-matched recency is the strongest next signal. |
 | `A01_aligned_user_int_dense_weighted_pooling_no_compile` | Next main experiment | Uses README same-fid alignment between `user_int_feats_{fid}` and `user_dense_feats_{fid}` as a small final residual. Default off; no compile. |
 | `P2_pair_time_match` | Paused candidate | Pair EDA shows target-history exact-match signal, but current priority is A01. Do not continue P2 v1/v2 until A01 is closed. |
 | Global recency / time_context | Rejected | T01 and R01 both failed official eval. Do not continue root timestamp, weekday/hour bucket, or global recency stats. |
 | SwiGLU route | Downgraded | Clean D02 official `0.814760` is below D01 `0.818095`. |
+
+## P3a_target_matched_recency_any_lite
+
+Only variable vs D01:
+
+```text
+--use_target_matched_recency 1
+--target_matched_recency_gate_init 0.005
+--target_matched_recency_feature_mode any_only
+--target_matched_recency_pairs_windows_json ""
+```
+
+Default P3a features:
+
+```text
+[12, seq_d, 25] windows = 30m,2h,6h,1d,3d,7d,30d
+[6,  seq_d, 24] windows = 30m,2h,6h,1d,3d,7d,30d
+[13, seq_d, 25] windows = 1d,3d,7d,30d
+[83, seq_d, 25] windows = 30m,2h,6h,1d,3d,7d,30d
+[9,  seq_d, 25] windows = 30m,2h,6h,1d,3d,7d,30d
+```
+
+Feature count: `32`. First version is `recent_any` only. Do not add `5`/`81`,
+log_count, last_gap, bare match_any, or global recency.
+
+Platform command:
+
+```bash
+bash TAAC/train/run.sh \
+  --use_target_matched_recency 1 \
+  --target_matched_recency_gate_init 0.005 \
+  --target_matched_recency_feature_mode any_only \
+  --target_matched_recency_pairs_windows_json ""
+```
+
+Expected startup log:
+
+```text
+use_target_matched_recency=1
+target_matched_recency_dim=32
+target_matched_recency_gate_init=0.005
+target_matched_recency_feature_mode=any_only
+target_matched_recency_feats diagnostics: dim=32
+seq_encoder_type=transformer
+user_dense_projector_type=grouped
+use_time_context=0
+use_seq_recent_stats=0
+use_pair_dense=0
+T=16
+```
 
 ## A01_aligned_user_int_dense_weighted_pooling_no_compile
 

@@ -27,7 +27,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS, PAIR_DENSE_DIM, SEQ_RECENT_STATS_DIM
+from dataset import (
+    FeatureSchema,
+    PCVRParquetDataset,
+    NUM_TIME_BUCKETS,
+    PAIR_DENSE_DIM,
+    SEQ_RECENT_STATS_DIM,
+    TARGET_MATCHED_RECENCY_DIM,
+    DEFAULT_TARGET_MATCHED_RECENCY_PAIRS_WINDOWS,
+)
 from model import PCVRHyFormer, ModelInput
 
 
@@ -76,6 +84,10 @@ _FALLBACK_MODEL_CFG = {
     'use_aligned_user_int_dense': False,
     'aligned_user_int_dense_gate_init': 0.05,
     'aligned_user_int_dense_fids': [62, 63, 64, 65, 66, 89, 90, 91],
+    'use_target_matched_recency': False,
+    'target_matched_recency_dim': TARGET_MATCHED_RECENCY_DIM,
+    'target_matched_recency_gate_init': 0.005,
+    'target_matched_recency_feature_mode': 'any_only',
     'emb_skip_threshold': 5000000,
     'seq_id_threshold': 10000,
     'ns_tokenizer_type': 'rankmixer',
@@ -476,6 +488,8 @@ def _batch_to_model_input(
         time_context=device_batch.get('time_context', None),
         seq_recent_stats=device_batch.get('seq_recent_stats', None),
         pair_dense_feats=device_batch.get('pair_dense_feats', None),
+        target_matched_recency_feats=device_batch.get(
+            'target_matched_recency_feats', None),
     )
 
 
@@ -517,6 +531,12 @@ def main() -> None:
         buffer_batches=0,
         is_training=False,
         pair_dense_pairs=train_config.get('pair_dense_pairs', None),
+        target_matched_recency_pairs_windows=(
+            train_config.get(
+                'target_matched_recency_pairs_windows',
+                DEFAULT_TARGET_MATCHED_RECENCY_PAIRS_WINDOWS)
+            if train_config.get('use_target_matched_recency', False)
+            else []),
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
@@ -543,6 +563,15 @@ def main() -> None:
         model_cfg.get('use_aligned_user_int_dense'),
         model_cfg.get('aligned_user_int_dense_gate_init'),
         model_cfg.get('aligned_user_int_dense_fids'),
+    )
+    logging.info(
+        "Effective target_matched_recency config: use_target_matched_recency=%s, "
+        "target_matched_recency_dim=%s, target_matched_recency_gate_init=%s, "
+        "target_matched_recency_feature_mode=%s",
+        model_cfg.get('use_target_matched_recency'),
+        model_cfg.get('target_matched_recency_dim'),
+        model_cfg.get('target_matched_recency_gate_init'),
+        model_cfg.get('target_matched_recency_feature_mode'),
     )
 
     # ns_groups_json also comes from training config (e.g. run.sh may have

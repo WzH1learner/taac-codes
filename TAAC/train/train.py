@@ -21,6 +21,7 @@ import torch
 from utils import set_seed, EarlyStopping, create_logger
 from dataset import (
     DEFAULT_PAIR_DENSE_PAIRS,
+    DEFAULT_TARGET_MATCHED_RECENCY_PAIRS_WINDOWS,
     FeatureSchema,
     NUM_TIME_BUCKETS,
     PAIR_DENSE_FEATS_PER_PAIR,
@@ -66,6 +67,25 @@ def load_aligned_user_int_dense_fids(fids_json: str) -> List[int]:
     else:
         values = json.loads(fids_json)
     return [int(v) for v in values]
+
+
+def load_target_matched_recency_pairs_windows(specs_json: str) -> List[dict]:
+    if not specs_json:
+        return DEFAULT_TARGET_MATCHED_RECENCY_PAIRS_WINDOWS
+    if os.path.exists(specs_json):
+        with open(specs_json, 'r', encoding='utf-8') as f:
+            values = json.load(f)
+    else:
+        values = json.loads(specs_json)
+    normalized = []
+    for spec in values:
+        normalized.append({
+            "item_fid": int(spec["item_fid"]),
+            "domain": str(spec["domain"]),
+            "side_fid": int(spec["side_fid"]),
+            "windows": [str(w) for w in spec.get("windows", [])],
+        })
+    return normalized
 
 
 def parse_args() -> argparse.Namespace:
@@ -223,6 +243,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--aligned_user_int_dense_fids_json', type=str, default='',
                         help='Path to or inline JSON list of aligned fids; empty uses '
                              'the default A01 fids')
+    parser.add_argument('--use_target_matched_recency', type=int, default=0, choices=[0, 1],
+                        help='Add target-matched recency any features as a final residual')
+    parser.add_argument('--target_matched_recency_gate_init', type=float, default=0.005,
+                        help='Initial scalar residual gate for --use_target_matched_recency')
+    parser.add_argument('--target_matched_recency_pairs_windows_json', type=str, default='',
+                        help='Path to or inline JSON list of P3 pair/window specs; '
+                             'empty uses built-in P3a lite specs')
+    parser.add_argument('--target_matched_recency_feature_mode', type=str, default='any_only',
+                        choices=['any_only'],
+                        help='P3 feature mode. P3a supports any_only only.')
     parser.add_argument('--user_dense_projector_type', type=str, default='flat',
                         choices=['flat', 'grouped'],
                         help='flat keeps the legacy concat projection; grouped uses fid-aware dense branches')
@@ -295,6 +325,11 @@ def parse_args() -> argparse.Namespace:
     args.pair_dense_dim = len(args.pair_dense_pairs) * PAIR_DENSE_FEATS_PER_PAIR
     args.aligned_user_int_dense_fids = load_aligned_user_int_dense_fids(
         args.aligned_user_int_dense_fids_json)
+    args.target_matched_recency_pairs_windows = (
+        load_target_matched_recency_pairs_windows(
+            args.target_matched_recency_pairs_windows_json))
+    args.target_matched_recency_dim = sum(
+        len(spec["windows"]) for spec in args.target_matched_recency_pairs_windows)
 
     # Environment variables take precedence.
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
@@ -338,6 +373,14 @@ def main() -> None:
         f"aligned_user_int_dense_gate_init={args.aligned_user_int_dense_gate_init}, "
         f"aligned_user_int_dense_fids={args.aligned_user_int_dense_fids}"
     )
+    logging.info(
+        "Effective target_matched_recency config: "
+        f"use_target_matched_recency={args.use_target_matched_recency}, "
+        f"target_matched_recency_dim={args.target_matched_recency_dim}, "
+        f"target_matched_recency_gate_init={args.target_matched_recency_gate_init}, "
+        f"target_matched_recency_feature_mode={args.target_matched_recency_feature_mode}, "
+        f"target_matched_recency_pairs_windows={args.target_matched_recency_pairs_windows}"
+    )
 
     # ---- Data loading ----
     if args.schema_path:
@@ -371,7 +414,19 @@ def main() -> None:
         seed=args.seed,
         seq_max_lens=seq_max_lens,
         pair_dense_pairs=args.pair_dense_pairs,
+        target_matched_recency_pairs_windows=(
+            args.target_matched_recency_pairs_windows
+            if args.use_target_matched_recency else []),
     )
+    if (
+        args.use_target_matched_recency
+        and getattr(pcvr_dataset, "target_matched_recency_active_specs", 0) == 0
+    ):
+        logging.warning(
+            "use_target_matched_recency=1 but no usable target-matched recency "
+            "fields were found; disabling the residual to keep checkpoint shape safe")
+        args.use_target_matched_recency = 0
+        args.target_matched_recency_dim = 0
 
     # ---- NS groups ----
     if args.ns_groups_json and os.path.exists(args.ns_groups_json):
@@ -432,6 +487,10 @@ def main() -> None:
         "use_aligned_user_int_dense": bool(args.use_aligned_user_int_dense),
         "aligned_user_int_dense_gate_init": args.aligned_user_int_dense_gate_init,
         "aligned_user_int_dense_fids": args.aligned_user_int_dense_fids,
+        "use_target_matched_recency": bool(args.use_target_matched_recency),
+        "target_matched_recency_dim": args.target_matched_recency_dim,
+        "target_matched_recency_gate_init": args.target_matched_recency_gate_init,
+        "target_matched_recency_feature_mode": args.target_matched_recency_feature_mode,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
         "ns_tokenizer_type": args.ns_tokenizer_type,
