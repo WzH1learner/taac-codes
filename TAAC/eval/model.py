@@ -21,6 +21,7 @@ class ModelInput(NamedTuple):
     seq_recent_stats: Optional[torch.Tensor] = None  # [B, 4 domains * 7 stats]
     pair_dense_feats: Optional[torch.Tensor] = None  # [B, selected_pairs * 7 stats]
     target_matched_recency_feats: Optional[torch.Tensor] = None  # [B, P3a any-only feats]
+    seq_target_match_flags: Optional[Dict[str, torch.Tensor]] = None  # {domain: [B, L, F]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1459,6 +1460,10 @@ class PCVRHyFormer(nn.Module):
         target_matched_recency_dim: int = 32,
         target_matched_recency_gate_init: float = 0.005,
         target_matched_recency_feature_mode: str = "any_only",
+        use_seq_target_match_flags: Union[bool, int] = False,
+        seq_target_match_flag_num_flags: int = 0,
+        seq_target_match_flag_gate_init: float = 0.01,
+        seq_target_match_flag_domain: str = "seq_d",
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
         # NS tokenizer variant
@@ -1492,6 +1497,9 @@ class PCVRHyFormer(nn.Module):
         if self.target_matched_recency_feature_mode != "any_only":
             raise ValueError(
                 "target_matched_recency_feature_mode currently supports only 'any_only'")
+        self.use_seq_target_match_flags = bool(use_seq_target_match_flags)
+        self.seq_target_match_flag_num_flags = int(seq_target_match_flag_num_flags)
+        self.seq_target_match_flag_domain = str(seq_target_match_flag_domain)
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
@@ -1809,6 +1817,24 @@ class PCVRHyFormer(nn.Module):
                     self.target_matched_recency_dim)
                 self.use_target_matched_recency = False
             logging.info("target_matched_recency disabled")
+        if self.use_seq_target_match_flags and self.seq_target_match_flag_num_flags > 0:
+            self.seq_target_match_flag_proj = nn.Linear(
+                self.seq_target_match_flag_num_flags, d_model)
+            self.seq_target_match_flag_gate = nn.Parameter(
+                torch.tensor(float(seq_target_match_flag_gate_init), dtype=torch.float32))
+            logging.info(
+                "seq_target_match_flags enabled: domain=%s, num_flags=%d, gate_init=%.4f",
+                self.seq_target_match_flag_domain,
+                self.seq_target_match_flag_num_flags,
+                float(seq_target_match_flag_gate_init),
+            )
+        else:
+            if self.use_seq_target_match_flags:
+                logging.warning(
+                    "seq_target_match_flags requested but num_flags=%d; disabled",
+                    self.seq_target_match_flag_num_flags)
+                self.use_seq_target_match_flags = False
+            logging.info("seq_target_match_flags disabled")
 
         # Dropout
         self.emb_dropout = nn.Dropout(dropout_rate)
@@ -2040,6 +2066,41 @@ class PCVRHyFormer(nn.Module):
             user_dense_tok = user_dense_tok + self.time_context_proj(time_ctx)
         return user_dense_tok.unsqueeze(1)
 
+    def _apply_seq_target_match_flags(
+        self,
+        domain: str,
+        token_emb: torch.Tensor,
+        inputs: ModelInput,
+    ) -> torch.Tensor:
+        if (
+            not self.use_seq_target_match_flags
+            or domain != self.seq_target_match_flag_domain
+            or not inputs.seq_target_match_flags
+        ):
+            return token_emb
+        flags = inputs.seq_target_match_flags.get(domain)
+        if flags is None:
+            return token_emb
+        if flags.shape[0] != token_emb.shape[0] or flags.shape[1] != token_emb.shape[1]:
+            logging.warning(
+                "seq_target_match_flags shape mismatch for %s: flags=%s, token_emb=%s; skipped",
+                domain,
+                tuple(flags.shape),
+                tuple(token_emb.shape),
+            )
+            return token_emb
+        if flags.shape[2] != self.seq_target_match_flag_num_flags:
+            logging.warning(
+                "seq_target_match_flags num_flags mismatch for %s: got=%d, expected=%d; skipped",
+                domain,
+                int(flags.shape[2]),
+                self.seq_target_match_flag_num_flags,
+            )
+            return token_emb
+        flags = flags.to(device=token_emb.device, dtype=token_emb.dtype)
+        flag_emb = self.seq_target_match_flag_proj(flags)
+        return token_emb + self.seq_target_match_flag_gate.to(token_emb.dtype) * flag_emb
+
     def _apply_seq_recent_stats(
         self,
         final_repr: torch.Tensor,
@@ -2130,6 +2191,7 @@ class PCVRHyFormer(nn.Module):
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain],
                 inputs.seq_time_deltas.get(domain))
+            tokens = self._apply_seq_target_match_flags(domain, tokens, inputs)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -2176,6 +2238,7 @@ class PCVRHyFormer(nn.Module):
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain],
                 inputs.seq_time_deltas.get(domain))
+            tokens = self._apply_seq_target_match_flags(domain, tokens, inputs)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

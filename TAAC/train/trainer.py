@@ -251,6 +251,11 @@ class PCVRHyFormerRankingTrainer:
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 device_batch[k] = v.to(self.device, non_blocking=True)
+            elif isinstance(v, dict):
+                device_batch[k] = {
+                    kk: vv.to(self.device, non_blocking=True) if isinstance(vv, torch.Tensor) else vv
+                    for kk, vv in v.items()
+                }
             else:
                 device_batch[k] = v
         return device_batch
@@ -504,6 +509,7 @@ class PCVRHyFormerRankingTrainer:
             pair_dense_feats=device_batch.get('pair_dense_feats', None),
             target_matched_recency_feats=device_batch.get(
                 'target_matched_recency_feats', None),
+            seq_target_match_flags=device_batch.get('seq_target_match_flags', None),
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:

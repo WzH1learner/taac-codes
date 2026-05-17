@@ -21,6 +21,7 @@ import torch
 from utils import set_seed, EarlyStopping, create_logger
 from dataset import (
     DEFAULT_PAIR_DENSE_PAIRS,
+    DEFAULT_SEQ_TARGET_MATCH_FLAG_SPECS,
     DEFAULT_TARGET_MATCHED_RECENCY_PAIRS_WINDOWS,
     FeatureSchema,
     NUM_TIME_BUCKETS,
@@ -84,6 +85,24 @@ def load_target_matched_recency_pairs_windows(specs_json: str) -> List[dict]:
             "domain": str(spec["domain"]),
             "side_fid": int(spec["side_fid"]),
             "windows": [str(w) for w in spec.get("windows", [])],
+        })
+    return normalized
+
+
+def load_seq_target_match_flag_specs(specs_json: str) -> List[dict]:
+    if not specs_json:
+        return DEFAULT_SEQ_TARGET_MATCH_FLAG_SPECS
+    if os.path.exists(specs_json):
+        with open(specs_json, 'r', encoding='utf-8') as f:
+            values = json.load(f)
+    else:
+        values = json.loads(specs_json)
+    normalized = []
+    for spec in values:
+        normalized.append({
+            "item_fid": int(spec["item_fid"]),
+            "domain": str(spec["domain"]),
+            "side_fid": int(spec["side_fid"]),
         })
     return normalized
 
@@ -253,6 +272,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--target_matched_recency_feature_mode', type=str, default='any_only',
                         choices=['any_only'],
                         help='P3 feature mode. P3a supports any_only only.')
+    parser.add_argument('--use_seq_target_match_flags', type=int, default=0, choices=[0, 1],
+                        help='Add target-match flag embeddings to sequence tokens')
+    parser.add_argument('--seq_target_match_flag_specs_json', type=str, default='',
+                        help='Path to or inline JSON list of P4 specs; empty uses built-in specs')
+    parser.add_argument('--seq_target_match_flag_gate_init', type=float, default=0.01,
+                        help='Initial scalar token-level gate for --use_seq_target_match_flags')
+    parser.add_argument('--seq_target_match_flag_domain', type=str, default='seq_d',
+                        help='Sequence domain that receives target-match flag embeddings')
     parser.add_argument('--user_dense_projector_type', type=str, default='flat',
                         choices=['flat', 'grouped'],
                         help='flat keeps the legacy concat projection; grouped uses fid-aware dense branches')
@@ -330,6 +357,11 @@ def parse_args() -> argparse.Namespace:
             args.target_matched_recency_pairs_windows_json))
     args.target_matched_recency_dim = sum(
         len(spec["windows"]) for spec in args.target_matched_recency_pairs_windows)
+    args.seq_target_match_flag_specs = load_seq_target_match_flag_specs(
+        args.seq_target_match_flag_specs_json)
+    args.seq_target_match_flag_num_flags = sum(
+        1 for spec in args.seq_target_match_flag_specs
+        if str(spec["domain"]) == str(args.seq_target_match_flag_domain))
 
     # Environment variables take precedence.
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
@@ -381,6 +413,14 @@ def main() -> None:
         f"target_matched_recency_feature_mode={args.target_matched_recency_feature_mode}, "
         f"target_matched_recency_pairs_windows={args.target_matched_recency_pairs_windows}"
     )
+    logging.info(
+        "Effective seq_target_match_flags config: "
+        f"use_seq_target_match_flags={args.use_seq_target_match_flags}, "
+        f"seq_target_match_flag_domain={args.seq_target_match_flag_domain}, "
+        f"seq_target_match_flag_num_flags={args.seq_target_match_flag_num_flags}, "
+        f"seq_target_match_flag_gate_init={args.seq_target_match_flag_gate_init}, "
+        f"seq_target_match_flag_specs={args.seq_target_match_flag_specs}"
+    )
 
     # ---- Data loading ----
     if args.schema_path:
@@ -417,6 +457,9 @@ def main() -> None:
         target_matched_recency_pairs_windows=(
             args.target_matched_recency_pairs_windows
             if args.use_target_matched_recency else []),
+        seq_target_match_flag_specs=(
+            args.seq_target_match_flag_specs
+            if args.use_seq_target_match_flags else []),
     )
     if (
         args.use_target_matched_recency
@@ -491,6 +534,10 @@ def main() -> None:
         "target_matched_recency_dim": args.target_matched_recency_dim,
         "target_matched_recency_gate_init": args.target_matched_recency_gate_init,
         "target_matched_recency_feature_mode": args.target_matched_recency_feature_mode,
+        "use_seq_target_match_flags": bool(args.use_seq_target_match_flags),
+        "seq_target_match_flag_num_flags": args.seq_target_match_flag_num_flags,
+        "seq_target_match_flag_gate_init": args.seq_target_match_flag_gate_init,
+        "seq_target_match_flag_domain": args.seq_target_match_flag_domain,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
         "ns_tokenizer_type": args.ns_tokenizer_type,

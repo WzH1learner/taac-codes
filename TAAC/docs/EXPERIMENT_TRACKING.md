@@ -123,11 +123,68 @@ python research/code/time_signal_eda.py \
 
 | Direction | Status | Rationale |
 | --- | --- | --- |
-| `P3a_target_matched_recency_any_lite` | Next main candidate | EDA v3 scanned `200000` rows / `1000` files with `future_or_invalid_ts_rate=0`; target-matched recency is the strongest next signal. |
-| `A01_aligned_user_int_dense_weighted_pooling_no_compile` | Next main experiment | Uses README same-fid alignment between `user_int_feats_{fid}` and `user_dense_feats_{fid}` as a small final residual. Default off; no compile. |
-| `P2_pair_time_match` | Paused candidate | Pair EDA shows target-history exact-match signal, but current priority is A01. Do not continue P2 v1/v2 until A01 is closed. |
+| `P4_seq_d_target_match_token_flag` | Next main candidate | P3a/A01/P2 final residuals made predictions too conservative. Next test injects target-match flags into `seq_d` tokens before the transformer. |
+| `test_aware_feature_audit` | Required EDA | Check target-match stability on official-like tails: `tail_2h`, `tail_6h`, `tail_24h`, `tail10`, `tail5`, `tail1`. |
+| `P3a_target_matched_recency_any_lite` | Rejected as residual route | Valid AUC `0.864184`, LogLoss `0.225655`, prob_mean `0.080864`; do not continue final_repr residual recency. |
+| `A01_aligned_user_int_dense_weighted_pooling_no_compile` | Rejected as residual route | prob_mean was compressed; do not continue A01 before stronger evidence. |
+| `P2_pair_time_match` | Paused candidate | Pair EDA shows target-history exact-match signal, but all-pair final residual underperformed. Current priority is P4 token-level injection. |
 | Global recency / time_context | Rejected | T01 and R01 both failed official eval. Do not continue root timestamp, weekday/hour bucket, or global recency stats. |
 | SwiGLU route | Downgraded | Clean D02 official `0.814760` is below D01 `0.818095`. |
+
+## P4_seq_d_target_match_token_flag
+
+Only variable vs D01:
+
+```text
+--use_seq_target_match_flags 1
+--seq_target_match_flag_gate_init 0.01
+--seq_target_match_flag_specs_json ""
+```
+
+Default specs:
+
+```text
+[12, seq_d, 25]
+[13, seq_d, 25]
+[9,  seq_d, 25]
+[83, seq_d, 25]
+[6,  seq_d, 24]
+```
+
+Design: dataset emits `seq_target_match_flags["seq_d"]` with shape
+`[B, L, 5]`. The model applies `Linear(5, d_model)` and adds
+`gate * flag_emb` to `seq_d` token embeddings before the sequence encoder.
+No final_repr residual, no RankMixer token, no recency window/count feature.
+
+Platform command:
+
+```bash
+bash TAAC/train/run.sh \
+  --use_seq_target_match_flags 1 \
+  --seq_target_match_flag_gate_init 0.01 \
+  --seq_target_match_flag_specs_json ""
+```
+
+Audit command:
+
+```bash
+python3 -u TAAC/research/code/test_aware_feature_audit.py \
+  --data_path "${TRAIN_DATA_PATH:-/data_ams/academic_training_data}" \
+  --max_files 1000 \
+  --max_rows 200000 \
+  --recursive_files 1 \
+  --write_csv 1 \
+  --summary_top_k 50 \
+  --output "${TRAIN_CKPT_PATH:-research/reports}/test_aware_feature_audit.md"
+```
+
+Log-friendly report preview:
+
+```bash
+awk '/^## Compact Summary/{flag=1} /^## Spec Details/{flag=0} flag{print}' "${TRAIN_CKPT_PATH}/test_aware_feature_audit.md"
+head -80 "${TRAIN_CKPT_PATH}/test_aware_feature_audit_specs.csv"
+head -80 "${TRAIN_CKPT_PATH}/test_aware_feature_audit_num_flags.csv"
+```
 
 ## P3a_target_matched_recency_any_lite
 

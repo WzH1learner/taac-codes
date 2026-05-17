@@ -35,6 +35,7 @@ from dataset import (
     SEQ_RECENT_STATS_DIM,
     TARGET_MATCHED_RECENCY_DIM,
     DEFAULT_TARGET_MATCHED_RECENCY_PAIRS_WINDOWS,
+    DEFAULT_SEQ_TARGET_MATCH_FLAG_SPECS,
 )
 from model import PCVRHyFormer, ModelInput
 
@@ -88,6 +89,10 @@ _FALLBACK_MODEL_CFG = {
     'target_matched_recency_dim': TARGET_MATCHED_RECENCY_DIM,
     'target_matched_recency_gate_init': 0.005,
     'target_matched_recency_feature_mode': 'any_only',
+    'use_seq_target_match_flags': False,
+    'seq_target_match_flag_num_flags': len(DEFAULT_SEQ_TARGET_MATCH_FLAG_SPECS),
+    'seq_target_match_flag_gate_init': 0.01,
+    'seq_target_match_flag_domain': 'seq_d',
     'emb_skip_threshold': 5000000,
     'seq_id_threshold': 10000,
     'ns_tokenizer_type': 'rankmixer',
@@ -457,6 +462,11 @@ def _batch_to_model_input(
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
             device_batch[k] = v.to(device, non_blocking=True)
+        elif isinstance(v, dict):
+            device_batch[k] = {
+                kk: vv.to(device, non_blocking=True) if isinstance(vv, torch.Tensor) else vv
+                for kk, vv in v.items()
+            }
         else:
             device_batch[k] = v
 
@@ -490,6 +500,7 @@ def _batch_to_model_input(
         pair_dense_feats=device_batch.get('pair_dense_feats', None),
         target_matched_recency_feats=device_batch.get(
             'target_matched_recency_feats', None),
+        seq_target_match_flags=device_batch.get('seq_target_match_flags', None),
     )
 
 
@@ -537,6 +548,12 @@ def main() -> None:
                 DEFAULT_TARGET_MATCHED_RECENCY_PAIRS_WINDOWS)
             if train_config.get('use_target_matched_recency', False)
             else []),
+        seq_target_match_flag_specs=(
+            train_config.get(
+                'seq_target_match_flag_specs',
+                DEFAULT_SEQ_TARGET_MATCH_FLAG_SPECS)
+            if train_config.get('use_seq_target_match_flags', False)
+            else []),
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
@@ -572,6 +589,16 @@ def main() -> None:
         model_cfg.get('target_matched_recency_dim'),
         model_cfg.get('target_matched_recency_gate_init'),
         model_cfg.get('target_matched_recency_feature_mode'),
+    )
+    logging.info(
+        "Effective seq_target_match_flags config: use_seq_target_match_flags=%s, "
+        "seq_target_match_flag_domain=%s, seq_target_match_flag_num_flags=%s, "
+        "seq_target_match_flag_gate_init=%s, seq_target_match_flag_specs=%s",
+        model_cfg.get('use_seq_target_match_flags'),
+        model_cfg.get('seq_target_match_flag_domain'),
+        model_cfg.get('seq_target_match_flag_num_flags'),
+        model_cfg.get('seq_target_match_flag_gate_init'),
+        train_config.get('seq_target_match_flag_specs', DEFAULT_SEQ_TARGET_MATCH_FLAG_SPECS),
     )
 
     # ns_groups_json also comes from training config (e.g. run.sh may have

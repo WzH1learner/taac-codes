@@ -210,6 +210,13 @@ DEFAULT_TARGET_MATCHED_RECENCY_PAIRS_WINDOWS: List[Dict[str, Any]] = [
 ]
 TARGET_MATCHED_RECENCY_DIM = sum(
     len(spec["windows"]) for spec in DEFAULT_TARGET_MATCHED_RECENCY_PAIRS_WINDOWS)
+DEFAULT_SEQ_TARGET_MATCH_FLAG_SPECS: List[Dict[str, Any]] = [
+    {"item_fid": 12, "domain": "seq_d", "side_fid": 25},
+    {"item_fid": 13, "domain": "seq_d", "side_fid": 25},
+    {"item_fid": 9, "domain": "seq_d", "side_fid": 25},
+    {"item_fid": 83, "domain": "seq_d", "side_fid": 25},
+    {"item_fid": 6, "domain": "seq_d", "side_fid": 24},
+]
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -238,6 +245,7 @@ class PCVRParquetDataset(IterableDataset):
         is_training: bool = True,
         pair_dense_pairs: Optional[List[List[Any]]] = None,
         target_matched_recency_pairs_windows: Optional[List[Dict[str, Any]]] = None,
+        seq_target_match_flag_specs: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """
         Args:
@@ -268,6 +276,8 @@ class PCVRParquetDataset(IterableDataset):
             target_matched_recency_pairs_windows: optional P3a specs of the
                 form ``{"item_fid": int, "domain": str, "side_fid": int,
                 "windows": [str, ...]}``.
+            seq_target_match_flag_specs: optional P4 specs of the form
+                ``{"item_fid": int, "domain": str, "side_fid": int}``.
         """
         super().__init__()
 
@@ -329,6 +339,11 @@ class PCVRParquetDataset(IterableDataset):
             len(spec["windows"]) for spec in self.target_matched_recency_pairs_windows)
         self._target_matched_recency_specs_by_domain = (
             self._build_target_matched_recency_specs())
+        self.seq_target_match_flag_specs = self._normalize_seq_target_match_flag_specs(
+            seq_target_match_flag_specs)
+        self.seq_target_match_flag_dims_by_domain = self._seq_target_match_flag_dims()
+        self._seq_target_match_flag_specs_by_domain = (
+            self._build_seq_target_match_flag_specs())
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
@@ -354,6 +369,12 @@ class PCVRParquetDataset(IterableDataset):
         self._target_matched_recency_feats_logged = False
         self._target_matched_recency_future_ts_filtered_count = 0
         self._target_matched_recency_valid_ts_count = 0
+        self._buf_seq_target_match_flags: Dict[str, npt.NDArray[np.float32]] = {}
+        self._seq_target_match_flags_logged = False
+        for domain, dim in self.seq_target_match_flag_dims_by_domain.items():
+            max_len = self._seq_maxlen.get(domain, 0)
+            self._buf_seq_target_match_flags[domain] = np.zeros(
+                (B, max_len, dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
         self._buf_seq_td = {}
@@ -984,6 +1005,119 @@ class PCVRParquetDataset(IterableDataset):
                 if matches.any():
                     feats[i, feature_idx] = 1.0
 
+    def _normalize_seq_target_match_flag_specs(
+        self,
+        specs: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        raw_specs = [] if specs is None else specs
+        normalized: List[Dict[str, Any]] = []
+        for spec in raw_specs:
+            normalized.append({
+                "item_fid": int(spec["item_fid"]),
+                "domain": str(spec["domain"]),
+                "side_fid": int(spec["side_fid"]),
+            })
+        return normalized
+
+    def _seq_target_match_flag_dims(self) -> Dict[str, int]:
+        dims: Dict[str, int] = {}
+        for spec in self.seq_target_match_flag_specs:
+            domain = str(spec["domain"])
+            dims[domain] = dims.get(domain, 0) + 1
+        return dims
+
+    def _build_seq_target_match_flag_specs(
+        self,
+    ) -> Dict[str, List[Tuple[int, int, int, int, int, int]]]:
+        item_offsets = {
+            fid: (offset, length)
+            for fid, offset, length in self.item_int_schema.entries
+        }
+        specs_by_domain: Dict[str, List[Tuple[int, int, int, int, int, int]]] = {}
+        domain_feature_idx: Dict[str, int] = {}
+        active = 0
+        for spec in self.seq_target_match_flag_specs:
+            item_fid = int(spec["item_fid"])
+            domain = str(spec["domain"])
+            side_fid = int(spec["side_fid"])
+            flag_idx = domain_feature_idx.get(domain, 0)
+            domain_feature_idx[domain] = flag_idx + 1
+            if item_fid not in item_offsets:
+                logging.warning(
+                    "seq_target_match_flags: item_fid=%s missing from schema; "
+                    "flag kept zero", item_fid)
+                continue
+            side_fids = self.sideinfo_fids.get(domain)
+            if not side_fids or side_fid not in side_fids:
+                logging.warning(
+                    "seq_target_match_flags: %s side_fid=%s missing from schema; "
+                    "flag kept zero", domain, side_fid)
+                continue
+            item_offset, item_len = item_offsets[item_fid]
+            side_slot = side_fids.index(side_fid)
+            specs_by_domain.setdefault(domain, []).append(
+                (flag_idx, item_offset, item_len, side_slot, item_fid, side_fid)
+            )
+            active += 1
+        logging.info(
+            "seq_target_match_flags configured: dims_by_domain=%s, active_specs=%d, specs=%s",
+            self.seq_target_match_flag_dims_by_domain,
+            active,
+            self.seq_target_match_flag_specs,
+        )
+        if self.seq_target_match_flag_specs and active == 0:
+            logging.warning(
+                "seq_target_match_flags requested but no usable fields were found; "
+                "flags will remain all zero")
+        return specs_by_domain
+
+    def _maybe_log_seq_target_match_flags(
+        self,
+        flags_by_domain: Dict[str, "npt.NDArray[np.float32]"],
+    ) -> None:
+        if self._seq_target_match_flags_logged or not flags_by_domain:
+            return
+        for domain, flags in flags_by_domain.items():
+            if flags.size == 0:
+                continue
+            preview_dim = min(8, flags.shape[2])
+            head = flags[:, :, :preview_dim]
+            means = head.mean(axis=(0, 1))
+            max_vals = head.max(axis=(0, 1))
+            zero_rates = (head == 0).mean(axis=(0, 1))
+            logging.info(
+                "seq_target_match_flags diagnostics: domain=%s, shape=%s, "
+                "head_mean=%s, head_max=%s, head_zero_rate=%s",
+                domain,
+                tuple(flags.shape),
+                np.array2string(means, precision=4, separator=','),
+                np.array2string(max_vals, precision=4, separator=','),
+                np.array2string(zero_rates, precision=4, separator=','),
+            )
+        self._seq_target_match_flags_logged = True
+
+    def _fill_seq_target_match_flags_for_domain(
+        self,
+        domain: str,
+        item_int: "npt.NDArray[np.int64]",
+        seq_sideinfo: "npt.NDArray[np.int64]",
+        flags: "npt.NDArray[np.float32]",
+    ) -> None:
+        specs = self._seq_target_match_flag_specs_by_domain.get(domain)
+        if not specs:
+            return
+        B = item_int.shape[0]
+        for flag_idx, item_offset, item_len, side_slot, _item_fid, _side_fid in specs:
+            side_vals = seq_sideinfo[:, side_slot, :]
+            for i in range(B):
+                targets = item_int[i, item_offset:item_offset + item_len]
+                targets = targets[targets > 0]
+                if targets.size == 0:
+                    continue
+                flags[i, :, flag_idx] = (
+                    np.isin(side_vals[i], targets) & (side_vals[i] > 0)
+                ).astype(np.float32)
+
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
         """Convert an Arrow RecordBatch into a training-ready dict of tensors."""
         B = batch.num_rows
@@ -1075,6 +1209,10 @@ class PCVRParquetDataset(IterableDataset):
         pair_dense_feats[:] = 0.0
         target_matched_recency_feats = self._buf_target_matched_recency_feats[:B]
         target_matched_recency_feats[:] = 0.0
+        seq_target_match_flags_np: Dict[str, npt.NDArray[np.float32]] = {}
+        for domain, buf in self._buf_seq_target_match_flags.items():
+            seq_target_match_flags_np[domain] = buf[:B]
+            seq_target_match_flags_np[domain][:] = 0.0
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain_idx, domain in enumerate(self.seq_domains):
@@ -1217,6 +1355,13 @@ class PCVRParquetDataset(IterableDataset):
                 ts_padded,
                 timestamps,
             )
+            if domain in seq_target_match_flags_np:
+                self._fill_seq_target_match_flags_for_domain(
+                    domain,
+                    item_int,
+                    out,
+                    seq_target_match_flags_np[domain],
+                )
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
             result[f'{domain}_time_delta'] = torch.from_numpy(time_delta.copy())
 
@@ -1225,9 +1370,14 @@ class PCVRParquetDataset(IterableDataset):
         result['pair_dense_feats'] = torch.from_numpy(pair_dense_feats.copy())
         result['target_matched_recency_feats'] = torch.from_numpy(
             target_matched_recency_feats.copy())
+        result['seq_target_match_flags'] = {
+            domain: torch.from_numpy(flags.copy())
+            for domain, flags in seq_target_match_flags_np.items()
+        }
         self._maybe_log_seq_recent_stats(seq_recent_stats)
         self._maybe_log_pair_dense_feats(pair_dense_feats)
         self._maybe_log_target_matched_recency_feats(target_matched_recency_feats)
+        self._maybe_log_seq_target_match_flags(seq_target_match_flags_np)
         return result
 
 
@@ -1248,6 +1398,7 @@ def get_pcvr_data(
     seq_max_lens: Optional[Dict[str, int]] = None,
     pair_dense_pairs: Optional[List[List[Any]]] = None,
     target_matched_recency_pairs_windows: Optional[List[Dict[str, Any]]] = None,
+    seq_target_match_flag_specs: Optional[List[Dict[str, Any]]] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -1387,6 +1538,7 @@ def get_pcvr_data(
         clip_vocab=clip_vocab,
         pair_dense_pairs=pair_dense_pairs,
         target_matched_recency_pairs_windows=target_matched_recency_pairs_windows,
+        seq_target_match_flag_specs=seq_target_match_flag_specs,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -1413,6 +1565,7 @@ def get_pcvr_data(
         clip_vocab=clip_vocab,
         pair_dense_pairs=pair_dense_pairs,
         target_matched_recency_pairs_windows=target_matched_recency_pairs_windows,
+        seq_target_match_flag_specs=seq_target_match_flag_specs,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
