@@ -93,6 +93,8 @@ _FALLBACK_MODEL_CFG = {
     'seq_target_match_flag_num_flags': len(DEFAULT_SEQ_TARGET_MATCH_FLAG_SPECS),
     'seq_target_match_flag_gate_init': 0.01,
     'seq_target_match_flag_domain': 'seq_d',
+    'seq_d_side_projector_type': 'flat',
+    'seq_d_important_side_fids': [25, 24],
     'emb_skip_threshold': 5000000,
     'seq_id_threshold': 10000,
     'ns_tokenizer_type': 'rankmixer',
@@ -411,6 +413,7 @@ def build_model(
         item_dense_dim=dataset.item_dense_schema.total_dim,
         user_int_feature_fids=dataset.user_int_schema.feature_ids,
         user_dense_feature_specs=dataset.user_dense_schema.entries,
+        seq_feature_fids=dataset.sideinfo_fids,
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
@@ -599,6 +602,12 @@ def main() -> None:
         model_cfg.get('seq_target_match_flag_num_flags'),
         model_cfg.get('seq_target_match_flag_gate_init'),
         train_config.get('seq_target_match_flag_specs', DEFAULT_SEQ_TARGET_MATCH_FLAG_SPECS),
+    )
+    logging.info(
+        "Effective seq_d_side_projector config: seq_d_side_projector_type=%s, "
+        "seq_d_important_side_fids=%s",
+        model_cfg.get('seq_d_side_projector_type'),
+        model_cfg.get('seq_d_important_side_fids'),
     )
 
     # ns_groups_json also comes from training config (e.g. run.sh may have

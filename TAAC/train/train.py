@@ -34,6 +34,7 @@ from trainer import PCVRHyFormerRankingTrainer
 
 
 DEFAULT_ALIGNED_USER_INT_DENSE_FIDS = [62, 63, 64, 65, 66, 89, 90, 91]
+DEFAULT_SEQ_D_IMPORTANT_SIDE_FIDS = [25, 24]
 
 
 def build_feature_specs(
@@ -105,6 +106,17 @@ def load_seq_target_match_flag_specs(specs_json: str) -> List[dict]:
             "side_fid": int(spec["side_fid"]),
         })
     return normalized
+
+
+def load_seq_d_important_side_fids(fids_json: str) -> List[int]:
+    if not fids_json:
+        return DEFAULT_SEQ_D_IMPORTANT_SIDE_FIDS
+    if os.path.exists(fids_json):
+        with open(fids_json, 'r', encoding='utf-8') as f:
+            values = json.load(f)
+    else:
+        values = json.loads(fids_json)
+    return [int(v) for v in values]
 
 
 def parse_args() -> argparse.Namespace:
@@ -280,6 +292,11 @@ def parse_args() -> argparse.Namespace:
                         help='Initial scalar token-level gate for --use_seq_target_match_flags')
     parser.add_argument('--seq_target_match_flag_domain', type=str, default='seq_d',
                         help='Sequence domain that receives target-match flag embeddings')
+    parser.add_argument('--seq_d_side_projector_type', type=str, default='flat',
+                        choices=['flat', 'grouped'],
+                        help='Optional grouped sideinfo projector for seq_d only')
+    parser.add_argument('--seq_d_important_side_fids_json', type=str, default='',
+                        help='Path to or inline JSON list of important seq_d side fids; empty uses [25,24]')
     parser.add_argument('--user_dense_projector_type', type=str, default='flat',
                         choices=['flat', 'grouped'],
                         help='flat keeps the legacy concat projection; grouped uses fid-aware dense branches')
@@ -362,6 +379,8 @@ def parse_args() -> argparse.Namespace:
     args.seq_target_match_flag_num_flags = sum(
         1 for spec in args.seq_target_match_flag_specs
         if str(spec["domain"]) == str(args.seq_target_match_flag_domain))
+    args.seq_d_important_side_fids = load_seq_d_important_side_fids(
+        args.seq_d_important_side_fids_json)
 
     # Environment variables take precedence.
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
@@ -420,6 +439,11 @@ def main() -> None:
         f"seq_target_match_flag_num_flags={args.seq_target_match_flag_num_flags}, "
         f"seq_target_match_flag_gate_init={args.seq_target_match_flag_gate_init}, "
         f"seq_target_match_flag_specs={args.seq_target_match_flag_specs}"
+    )
+    logging.info(
+        "Effective seq_d_side_projector config: "
+        f"seq_d_side_projector_type={args.seq_d_side_projector_type}, "
+        f"seq_d_important_side_fids={args.seq_d_important_side_fids}"
     )
 
     # ---- Data loading ----
@@ -500,6 +524,7 @@ def main() -> None:
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
         "user_int_feature_fids": pcvr_dataset.user_int_schema.feature_ids,
         "user_dense_feature_specs": pcvr_dataset.user_dense_schema.entries,
+        "seq_feature_fids": pcvr_dataset.sideinfo_fids,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
@@ -538,6 +563,8 @@ def main() -> None:
         "seq_target_match_flag_num_flags": args.seq_target_match_flag_num_flags,
         "seq_target_match_flag_gate_init": args.seq_target_match_flag_gate_init,
         "seq_target_match_flag_domain": args.seq_target_match_flag_domain,
+        "seq_d_side_projector_type": args.seq_d_side_projector_type,
+        "seq_d_important_side_fids": args.seq_d_important_side_fids,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
         "ns_tokenizer_type": args.ns_tokenizer_type,

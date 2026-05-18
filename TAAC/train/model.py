@@ -1428,6 +1428,7 @@ class PCVRHyFormer(nn.Module):
         item_ns_groups: List[List[int]],
         user_int_feature_fids: Optional[List[int]] = None,
         user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
+        seq_feature_fids: Optional[Dict[str, List[int]]] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1471,6 +1472,8 @@ class PCVRHyFormer(nn.Module):
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
         user_dense_projector_type: str = 'flat',
+        seq_d_side_projector_type: str = 'flat',
+        seq_d_important_side_fids: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
 
@@ -1504,6 +1507,12 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.user_dense_projector_type = user_dense_projector_type
+        self.seq_d_side_projector_type = str(seq_d_side_projector_type)
+        self.seq_d_important_side_fids = [
+            int(fid) for fid in (
+                seq_d_important_side_fids if seq_d_important_side_fids is not None else [25, 24]
+            )
+        ]
 
         # ================== NS Tokens Construction ==================
 
@@ -1709,6 +1718,9 @@ class PCVRHyFormer(nn.Module):
         self._seq_is_id = {}        # domain -> is_id list
         self._seq_vocab_sizes = {}  # domain -> vocab_sizes list
         self._seq_proj = nn.ModuleDict()
+        self._seq_d_grouped_side_enabled = False
+        self._seq_d_grouped_important_positions: List[int] = []
+        self._seq_d_grouped_other_positions: List[int] = []
 
         for domain in self.seq_domains:
             vs = seq_vocab_sizes[domain]
@@ -1721,6 +1733,55 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(len(vs) * emb_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+        if self.seq_d_side_projector_type == 'grouped':
+            seq_d_fids = list((seq_feature_fids or {}).get('seq_d', []))
+            if 'seq_d' not in self.seq_domains:
+                logging.warning("seq_d_side_projector_type=grouped but seq_d is missing; using flat projector")
+            elif not seq_d_fids:
+                logging.warning("seq_d_side_projector_type=grouped but seq_d side fids are unavailable; using flat projector")
+            else:
+                important_fid_set = set(self.seq_d_important_side_fids)
+                important = [
+                    i for i, fid in enumerate(seq_d_fids)
+                    if int(fid) in important_fid_set
+                ]
+                important_pos_set = set(important)
+                other = [i for i in range(len(seq_d_fids)) if i not in important_pos_set]
+                missing = [
+                    fid for fid in self.seq_d_important_side_fids
+                    if fid not in {int(x) for x in seq_d_fids}
+                ]
+                if missing:
+                    logging.warning(
+                        "seq_d grouped side projector: important fids missing from seq_d sideinfo: %s",
+                        missing,
+                    )
+                if important:
+                    self._seq_d_grouped_side_enabled = True
+                    self._seq_d_grouped_important_positions = important
+                    self._seq_d_grouped_other_positions = other
+                    self.seq_d_important_proj = nn.Sequential(
+                        nn.Linear(len(important) * emb_dim, d_model),
+                        nn.LayerNorm(d_model),
+                    )
+                    if other:
+                        self.seq_d_other_proj = nn.Sequential(
+                            nn.Linear(len(other) * emb_dim, d_model),
+                            nn.LayerNorm(d_model),
+                        )
+                    logging.info(
+                        "seq_d grouped side projector enabled: important_fids=%s, "
+                        "important_positions=%s, other_count=%d",
+                        self.seq_d_important_side_fids,
+                        important,
+                        len(other),
+                    )
+                else:
+                    logging.warning(
+                        "seq_d_side_projector_type=grouped but no important fids were found; using flat projector")
+        elif self.seq_d_side_projector_type != 'flat':
+            raise ValueError(
+                f"Unknown seq_d_side_projector_type: {self.seq_d_side_projector_type}")
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
@@ -1998,6 +2059,56 @@ class PCVRHyFormer(nn.Module):
 
         return token_emb
 
+    def _embed_seq_domain_grouped_side(
+        self,
+        seq: torch.Tensor,
+        sideinfo_embs: nn.ModuleList,
+        proj: nn.Module,
+        is_id: List[bool],
+        emb_index: List[int],
+        time_bucket_ids: torch.Tensor,
+        time_delta_feats: Optional[torch.Tensor] = None,
+        domain: str = "",
+    ) -> torch.Tensor:
+        """Embeds seq_d with important/other sideinfo branches when enabled."""
+        if domain != 'seq_d' or not self._seq_d_grouped_side_enabled:
+            return self._embed_seq_domain(
+                seq, sideinfo_embs, proj, is_id, emb_index,
+                time_bucket_ids, time_delta_feats)
+
+        B, S, L = seq.shape
+        emb_list = []
+        for i in range(S):
+            real_idx = emb_index[i] if i < len(emb_index) else -1
+            if real_idx == -1:
+                emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
+            else:
+                emb = sideinfo_embs[real_idx]
+                e = emb(seq[:, i, :])
+                if is_id[i] and self.training:
+                    e = self.seq_id_emb_dropout(e)
+                emb_list.append(e)
+
+        important_emb = torch.cat(
+            [emb_list[i] for i in self._seq_d_grouped_important_positions],
+            dim=-1,
+        )
+        token_emb = F.gelu(self.seq_d_important_proj(important_emb))
+        if self._seq_d_grouped_other_positions:
+            other_emb = torch.cat(
+                [emb_list[i] for i in self._seq_d_grouped_other_positions],
+                dim=-1,
+            )
+            token_emb = token_emb + F.gelu(self.seq_d_other_proj(other_emb))
+
+        if self.num_time_buckets > 0:
+            token_emb = token_emb + self.time_embedding(time_bucket_ids)
+        if self.use_seq_time_delta_proj and time_delta_feats is not None:
+            delta = time_delta_feats.to(dtype=token_emb.dtype).unsqueeze(-1)
+            token_emb = token_emb + self.time_delta_proj(delta)
+
+        return token_emb
+
     def _make_padding_mask(
         self, seq_len: torch.Tensor, max_len: int
     ) -> torch.Tensor:
@@ -2185,12 +2296,13 @@ class PCVRHyFormer(nn.Module):
         seq_tokens_list = []
         seq_masks_list = []
         for domain in self.seq_domains:
-            tokens = self._embed_seq_domain(
+            tokens = self._embed_seq_domain_grouped_side(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain],
-                inputs.seq_time_deltas.get(domain))
+                inputs.seq_time_deltas.get(domain),
+                domain=domain)
             tokens = self._apply_seq_target_match_flags(domain, tokens, inputs)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
@@ -2232,12 +2344,13 @@ class PCVRHyFormer(nn.Module):
         seq_tokens_list = []
         seq_masks_list = []
         for domain in self.seq_domains:
-            tokens = self._embed_seq_domain(
+            tokens = self._embed_seq_domain_grouped_side(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain],
-                inputs.seq_time_deltas.get(domain))
+                inputs.seq_time_deltas.get(domain),
+                domain=domain)
             tokens = self._apply_seq_target_match_flags(domain, tokens, inputs)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
