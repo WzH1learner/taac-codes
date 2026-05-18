@@ -118,45 +118,94 @@ python research/code/time_signal_eda.py \
 | R01_seq_recent_stats_residual_v1 | D01 + `use_seq_recent_stats=1`, gate `0.1` | TBD | TBD | TBD | `0.808144` | Rejected. Global recency stats do not transfer to official eval. |
 | G01_group_tokenizer | Group tokenizer candidate | TBD | `0.8617` | TBD | TBD | Keep as possible G02 candidate, but not the mainline. |
 | D01_emb_skip_2w | D01 with lower embedding skip threshold | 6 | `0.864158` | `0.222410` | `0.808294` | Rejected by official eval. Do not continue this line. |
+| P4_seq_d_target_match_token_flag_full_5flags | D01 + token-level seq_d target-match flags `[12,13,9,83,6]`, gate `0.01` | TBD | TBD | TBD | `0.808359` | Rejected. Infer confirmed P4 was enabled; do not continue 5-flag version. |
 
 ## Active Direction
 
 | Direction | Status | Rationale |
 | --- | --- | --- |
-| `P4_seq_d_target_match_token_flag` | Next main candidate | P3a/A01/P2 final residuals made predictions too conservative. Next test injects target-match flags into `seq_d` tokens before the transformer. |
-| `test_aware_feature_audit` | Required EDA | Check target-match stability on official-like tails: `tail_2h`, `tail_6h`, `tail_24h`, `tail10`, `tail5`, `tail1`. |
+| `P4b_seq_d_target_match_token_flag_lite_83_6_gate005` | Next candidate only if spending another target-match run | P4 full failed official eval. EDA says stable specs are `13/83/6`, but `13` has very high true_rate and matched count, so P4b keeps only `83` and `6` with smaller gate `0.005`. |
+| `test_aware_feature_audit` | Completed for P4 full | `rows_scanned=200000`, `parquet_files_scanned=1000`, `strong_and_stable_specs=3`, `risky_specs=2`. |
 | `P3a_target_matched_recency_any_lite` | Rejected as residual route | Valid AUC `0.864184`, LogLoss `0.225655`, prob_mean `0.080864`; do not continue final_repr residual recency. |
 | `A01_aligned_user_int_dense_weighted_pooling_no_compile` | Rejected as residual route | prob_mean was compressed; do not continue A01 before stronger evidence. |
 | `P2_pair_time_match` | Paused candidate | Pair EDA shows target-history exact-match signal, but all-pair final residual underperformed. Current priority is P4 token-level injection. |
 | Global recency / time_context | Rejected | T01 and R01 both failed official eval. Do not continue root timestamp, weekday/hour bucket, or global recency stats. |
 | SwiGLU route | Downgraded | Clean D02 official `0.814760` is below D01 `0.818095`. |
 
-## P4_seq_d_target_match_token_flag
+## P4 Target-Match Token Flags
 
-Only variable vs D01:
+P4 full 5-flag result:
+
+```text
+P4_seq_d_target_match_token_flag_full_5flags
+official eval AUC = 0.808359
+decision = reject
+```
+
+Infer confirmed the intended path was active:
+
+```text
+seq_target_match_flags enabled: domain=seq_d, num_flags=5, gate_init=0.0100
+target_matched_recency disabled
+pair_dense disabled
+seq_recent_stats disabled
+aligned_user_int_dense disabled
+seq_target_match_flags configured: dims_by_domain={'seq_d': 5}, active_specs=5
+```
+
+Test-aware EDA:
+
+```text
+rows_scanned = 200000
+parquet_files_scanned = 1000
+strong_and_stable_specs = 3
+risky_specs = 2
+stable specs = 13|seq_d|25, 83|seq_d|25, 6|seq_d|24
+risky specs = 12|seq_d|25, 9|seq_d|25
+```
+
+Why full P4 failed / what to avoid:
+
+```text
+12 reverses in official-like tails: tail_2h_lift=0.480613, tail_6h_lift=0.716015.
+9 is not stable enough: tail_2h_lift≈0.999.
+13 is stable but true_rate > 0.83 with high matched token count; direct token-level flag may perturb too many seq_d tokens.
+Do not continue the 5-flag version.
+```
+
+Next lite candidate:
+
+```text
+P4b_seq_d_target_match_token_flag_lite_83_6_gate005
+```
+
+Only variables vs D01:
 
 ```text
 --use_seq_target_match_flags 1
---seq_target_match_flag_gate_init 0.01
---seq_target_match_flag_specs_json ""
+--seq_target_match_flag_gate_init 0.005
+--seq_target_match_flag_specs_json '[{"item_fid":83,"domain":"seq_d","side_fid":25},{"item_fid":6,"domain":"seq_d","side_fid":24}]'
 ```
 
-Default specs:
+Training command:
 
-```text
-[12, seq_d, 25]
-[13, seq_d, 25]
-[9,  seq_d, 25]
-[83, seq_d, 25]
-[6,  seq_d, 24]
+```bash
+bash TAAC/train/run.sh \
+  --use_seq_target_match_flags 1 \
+  --seq_target_match_flag_gate_init 0.005 \
+  --seq_target_match_flag_specs_json '[{"item_fid":83,"domain":"seq_d","side_fid":25},{"item_fid":6,"domain":"seq_d","side_fid":24}]'
 ```
 
 Design: dataset emits `seq_target_match_flags["seq_d"]` with shape
-`[B, L, 5]`. The model applies `Linear(5, d_model)` and adds
+`[B, L, num_flags]`. The model applies `Linear(num_flags, d_model)` and adds
 `gate * flag_emb` to `seq_d` token embeddings before the sequence encoder.
 No final_repr residual, no RankMixer token, no recency window/count feature.
 
-Platform command:
+Do not enable P3a / pair_dense / A01 / seq_recent_stats / time_context /
+compile. Use direct `TAAC/train/run.sh`; avoid nested wrapper commands because
+platform logs may hide the real active args.
+
+Archived full-P4 command:
 
 ```bash
 bash TAAC/train/run.sh \
@@ -168,7 +217,11 @@ bash TAAC/train/run.sh \
 Audit command:
 
 ```bash
-python3 -u TAAC/research/code/test_aware_feature_audit.py \
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+EDA_SCRIPT="${SCRIPT_DIR}/test_aware_feature_audit.py"
+if [ ! -f "${EDA_SCRIPT}" ]; then EDA_SCRIPT="${SCRIPT_DIR}/TAAC/research/code/test_aware_feature_audit.py"; fi
+if [ ! -f "${EDA_SCRIPT}" ]; then EDA_SCRIPT="${SCRIPT_DIR}/research/code/test_aware_feature_audit.py"; fi
+python3 -u "${EDA_SCRIPT}" \
   --data_path "${TRAIN_DATA_PATH:-/data_ams/academic_training_data}" \
   --max_files 1000 \
   --max_rows 200000 \
