@@ -39,6 +39,9 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --sparse_lr 0.05 \
     --dropout_rate 0.01 \
     --patience 15 \
+    --keep_top_k_checkpoints 1 \
+    --checkpoint_select_metric auc \
+    --always_save_last_checkpoint 0 \
     --reinit_sparse_after_epoch 0 \
     --reinit_cardinality_threshold 0 \
     --loss_type bce \
@@ -58,6 +61,20 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #   RuntimeError: Expected curr_block->next == nullptr ...
 # Treat reduce-overhead compile as rejected/invalid for this environment.
 # Do not use compile metrics as a screening baseline.
+
+# ---- Low-risk D01 search candidates ----
+# Keep these close to D01. Optionally append:
+#   --keep_top_k_checkpoints 3 --checkpoint_select_metric auc_then_logloss
+# when rerunning D01 / seed sweeps and selecting among near-tie valid epochs.
+#
+# D01_seed2026_epoch10:
+#   bash TAAC/train/run.sh --seed 2026 --num_epochs 10 --patience 5
+#
+# D01_dropout0_epoch10:
+#   bash TAAC/train/run.sh --dropout_rate 0.0 --num_epochs 10 --patience 5
+#
+# D01_sparse_lr003_epoch10:
+#   bash TAAC/train/run.sh --sparse_lr 0.03 --num_epochs 10 --patience 5
 
 # ---- A01 candidate: aligned user_int/user_dense weighted pooling ----
 # Purpose: use same-fid user_dense values as weights over aligned user_int

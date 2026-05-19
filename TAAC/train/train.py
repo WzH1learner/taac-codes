@@ -187,11 +187,17 @@ def parse_args() -> argparse.Namespace:
                              'but its metrics become monitoring signals rather '
                              'than strict holdout metrics.')
     parser.add_argument('--checkpoint_select_metric', type=str, default='auc',
-                        choices=['auc', 'last'],
-                        help='How to choose the single platform-facing best_model. '
-                             'auc keeps the historical best-valid-AUC behavior; '
-                             'last overwrites best_model at every validation, '
-                             'which is useful when training includes validation rows.')
+                        choices=['auc', 'logloss', 'auc_then_logloss'],
+                        help='Checkpoint ranking metric. auc keeps the historical '
+                             'best-valid-AUC behavior; logloss prefers lower valid '
+                             'LogLoss; auc_then_logloss treats AUC values within '
+                             '0.0003 as ties, then uses LogLoss/Brier/prob-gap.')
+    parser.add_argument('--keep_top_k_checkpoints', type=int, default=1,
+                        help='Keep top-K validation checkpoints. Default 1 preserves '
+                             'the historical single best_model behavior.')
+    parser.add_argument('--always_save_last_checkpoint', type=int, default=0,
+                        choices=[0, 1],
+                        help='Also keep a rolling last checkpoint after each epoch/validation.')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -632,6 +638,8 @@ def main() -> None:
         amp=args.amp,
         amp_dtype=args.amp_dtype,
         checkpoint_select_metric=args.checkpoint_select_metric,
+        keep_top_k_checkpoints=args.keep_top_k_checkpoints,
+        always_save_last_checkpoint=bool(args.always_save_last_checkpoint),
     )
 
     trainer.train()

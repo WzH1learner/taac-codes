@@ -119,12 +119,18 @@ python research/code/time_signal_eda.py \
 | G01_group_tokenizer | Group tokenizer candidate | TBD | `0.8617` | TBD | TBD | Keep as possible G02 candidate, but not the mainline. |
 | D01_emb_skip_2w | D01 with lower embedding skip threshold | 6 | `0.864158` | `0.222410` | `0.808294` | Rejected by official eval. Do not continue this line. |
 | P4_seq_d_target_match_token_flag_full_5flags | D01 + token-level seq_d target-match flags `[12,13,9,83,6]`, gate `0.01` | TBD | TBD | TBD | `0.808359` | Rejected. Infer confirmed P4 was enabled; do not continue 5-flag version. |
+| P4b_seq_d_target_match_token_flag_lite_83_6_gate005 | D01 + token-level seq_d target-match flags `[83,6]`, gate `0.005` | TBD | TBD | TBD | `0.8028` | Rejected. Pause P4 series; do not continue P4c / flag-specific gates. |
+| S01_seq_d_sideinfo_grouped_projector_25_24 | D01 + grouped seq_d sideinfo projector for fids `[25,24]` | 6 | `0.864147` | `0.222898` | `0.801289` | Rejected. Official score is far below D01. |
+| D03_seq_len_192_384 | D01 + longer sequence length | TBD | `0.864719` | TBD | `0.811244` | Rejected. Valid improved but official did not transfer. |
 
 ## Active Direction
 
 | Direction | Status | Rationale |
 | --- | --- | --- |
-| `P4b_seq_d_target_match_token_flag_lite_83_6_gate005` | Next candidate only if spending another target-match run | P4 full failed official eval. EDA says stable specs are `13/83/6`, but `13` has very high true_rate and matched count, so P4b keeps only `83` and `6` with smaller gate `0.005`. |
+| `D01 low-risk rerun / seed sweep` | Next priority | Official test is a very narrow time window and valid ranking has repeatedly disagreed with official. Return near D01 and search low-risk knobs. |
+| `checkpoint top-k infrastructure` | Required before more reruns | D01 reruns / seed sweep must keep top-k checkpoints and compare AUC near-ties by LogLoss/Brier/prob-gap. |
+| `I01/P3/P4/S01/A01/P2/D03` | Paused | Do not continue new structures until D01-adjacent search is exhausted. |
+| `P4 target-match token flags` | Paused / rejected | P4 full official `0.808359`; P4b official `0.8028`. Do not continue P4c or flag-specific gates for now. |
 | `test_aware_feature_audit` | Completed for P4 full | `rows_scanned=200000`, `parquet_files_scanned=1000`, `strong_and_stable_specs=3`, `risky_specs=2`. |
 | `P3a_target_matched_recency_any_lite` | Rejected as residual route | Valid AUC `0.864184`, LogLoss `0.225655`, prob_mean `0.080864`; do not continue final_repr residual recency. |
 | `A01_aligned_user_int_dense_weighted_pooling_no_compile` | Rejected as residual route | prob_mean was compressed; do not continue A01 before stronger evidence. |
@@ -205,6 +211,50 @@ Do not enable P3a / pair_dense / A01 / seq_recent_stats / time_context /
 compile. Use direct `TAAC/train/run.sh`; avoid nested wrapper commands because
 platform logs may hide the real active args.
 
+## Checkpoint Selection Infrastructure
+
+Defaults preserve D01 behavior:
+
+```text
+--keep_top_k_checkpoints 1
+--checkpoint_select_metric auc
+--always_save_last_checkpoint 0
+```
+
+For D01 reruns / seed sweep, use top-k:
+
+```text
+--keep_top_k_checkpoints 3
+--checkpoint_select_metric auc_then_logloss
+```
+
+`auc_then_logloss` ranking:
+
+```text
+1. Higher valid AUC wins.
+2. If AUC difference <= 0.0003, lower LogLoss wins.
+3. Then lower Brier.
+4. Then smaller abs(prob_mean - label_mean).
+```
+
+Checkpoint directory names include `step`, `epoch`, `AUC`, `LogLoss`, and
+`Brier` for platform-side selection. `--always_save_last_checkpoint 1` keeps a
+rolling `.last` checkpoint in addition to top-k/best.
+
+Low-risk candidates:
+
+```bash
+bash TAAC/train/run.sh --seed 2026 --num_epochs 10 --patience 5
+bash TAAC/train/run.sh --dropout_rate 0.0 --num_epochs 10 --patience 5
+bash TAAC/train/run.sh --sparse_lr 0.03 --num_epochs 10 --patience 5
+```
+
+Optional top-k add-on:
+
+```bash
+--keep_top_k_checkpoints 3 --checkpoint_select_metric auc_then_logloss
+```
+
 Archived full-P4 command:
 
 ```bash
@@ -213,6 +263,46 @@ bash TAAC/train/run.sh \
   --seq_target_match_flag_gate_init 0.01 \
   --seq_target_match_flag_specs_json ""
 ```
+
+P4b lite result:
+
+```text
+P4b_seq_d_target_match_token_flag_lite_83_6_gate005
+official eval AUC = 0.8028
+decision = reject
+```
+
+Conclusion: pause the P4 series. Do not continue P4c or flag-specific gates
+until there is new EDA evidence.
+
+## S01_seq_d_sideinfo_grouped_projector_25_24
+
+Result:
+
+```text
+best epoch = 6
+valid AUC = 0.8641473902303051
+LogLoss = 0.22289758920669556
+Brier = 0.0640855
+label_mean = 0.0967852
+prob_mean = 0.0967916
+prob_std = 0.158664
+official eval = CUDA OOM, no score
+```
+
+Infer confirmed S01 was enabled and other experimental branches were off:
+
+```text
+seq_d grouped side projector enabled: important_fids=[25,24], important_positions=[7,8], other_count=7
+seq_target_match_flags disabled
+target_matched_recency disabled
+pair_dense disabled
+seq_recent_stats disabled
+```
+
+Conclusion: S01 is a weak candidate. It improves calibration metrics versus
+D01 but has lower valid AUC; official eval failed by CUDA OOM, not strict load
+or config error. Retry only if eval quota is loose.
 
 Audit command:
 

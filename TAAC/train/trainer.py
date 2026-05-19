@@ -9,8 +9,10 @@ import glob
 import shutil
 import logging
 import time
+import math
 from contextlib import nullcontext
-from typing import Any, Dict, Optional, Tuple
+from functools import cmp_to_key
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -63,6 +65,8 @@ class PCVRHyFormerRankingTrainer:
         amp: bool = False,
         amp_dtype: str = 'bfloat16',
         checkpoint_select_metric: str = 'auc',
+        keep_top_k_checkpoints: int = 1,
+        always_save_last_checkpoint: bool = False,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -113,6 +117,9 @@ class PCVRHyFormerRankingTrainer:
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
         self.checkpoint_select_metric: str = checkpoint_select_metric
+        self.keep_top_k_checkpoints: int = max(1, int(keep_top_k_checkpoints))
+        self.always_save_last_checkpoint: bool = bool(always_save_last_checkpoint)
+        self._top_checkpoint_records: List[Dict[str, Any]] = []
         self.amp_enabled: bool = bool(
             amp and str(device).startswith('cuda') and torch.cuda.is_available()
         )
@@ -131,7 +138,12 @@ class PCVRHyFormerRankingTrainer:
             f"AMP config: enabled={self.amp_enabled}, dtype={amp_dtype}, "
             f"grad_scaler_enabled={self.grad_scaler.is_enabled()}"
         )
-        logging.info(f"Checkpoint selection metric: {self.checkpoint_select_metric}")
+        logging.info(
+            "Checkpoint config: select_metric=%s, keep_top_k=%d, always_save_last=%s",
+            self.checkpoint_select_metric,
+            self.keep_top_k_checkpoints,
+            self.always_save_last_checkpoint,
+        )
 
     def _amp_context(self):
         if self.amp_enabled:
@@ -152,7 +164,12 @@ class PCVRHyFormerRankingTrainer:
             )
             logging.info(f"{prefix} metrics @ step {step}: {formatted}")
 
-    def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
+    def _build_step_dir_name(
+        self,
+        global_step: int,
+        is_best: bool = False,
+        metrics: Optional[Dict[str, float]] = None,
+    ) -> str:
         """Build a checkpoint sub-directory name such as
         ``global_step2500.layer=2.head=4.hidden=64[.best_model]``.
         """
@@ -160,6 +177,15 @@ class PCVRHyFormerRankingTrainer:
         for key in ("layer", "head", "hidden"):
             if key in self.ckpt_params:
                 parts.append(f"{key}={self.ckpt_params[key]}")
+        if metrics:
+            if "epoch" in metrics and np.isfinite(metrics["epoch"]):
+                parts.append(f"epoch={int(metrics['epoch'])}")
+            if "auc" in metrics and np.isfinite(metrics["auc"]):
+                parts.append(f"AUC={metrics['auc']:.6f}")
+            if "logloss" in metrics and np.isfinite(metrics["logloss"]):
+                parts.append(f"LogLoss={metrics['logloss']:.6f}")
+            if "brier" in metrics and np.isfinite(metrics["brier"]):
+                parts.append(f"Brier={metrics['brier']:.6f}")
         name = ".".join(parts)
         if is_best:
             name += ".best_model"
@@ -212,6 +238,8 @@ class PCVRHyFormerRankingTrainer:
         global_step: int,
         is_best: bool = False,
         skip_model_file: bool = False,
+        metrics: Optional[Dict[str, float]] = None,
+        dir_suffix: str = "",
     ) -> str:
         """Save ``model.pt`` plus sidecar files under a ``global_step`` sub-dir.
 
@@ -225,7 +253,10 @@ class PCVRHyFormerRankingTrainer:
         Returns:
             The absolute path of the checkpoint directory.
         """
-        dir_name = self._build_step_dir_name(global_step, is_best=is_best)
+        dir_name = self._build_step_dir_name(
+            global_step, is_best=is_best, metrics=metrics)
+        if dir_suffix:
+            dir_name += dir_suffix
         ckpt_dir = os.path.join(self.save_dir, dir_name)
         os.makedirs(ckpt_dir, exist_ok=True)
         if not skip_model_file:
@@ -242,6 +273,104 @@ class PCVRHyFormerRankingTrainer:
         for old_dir in glob.glob(pattern):
             shutil.rmtree(old_dir)
             logging.info(f"Removed old best_model dir: {old_dir}")
+
+    def _checkpoint_record_key(self, record: Dict[str, Any]) -> Tuple[float, float, float, float]:
+        auc = float(record.get("auc", float("-inf")))
+        logloss = float(record.get("logloss", float("inf")))
+        brier = float(record.get("brier", float("inf")))
+        prob_gap = float(record.get("prob_gap", float("inf")))
+        if self.checkpoint_select_metric == 'logloss':
+            return (-logloss, auc, -brier, -prob_gap)
+        if self.checkpoint_select_metric == 'auc_then_logloss':
+            return (auc, -logloss, -brier, -prob_gap)
+        return (auc, -logloss, -brier, -prob_gap)
+
+    def _checkpoint_compare(self, left: Dict[str, Any], right: Dict[str, Any]) -> int:
+        if self.checkpoint_select_metric != 'auc_then_logloss':
+            lk = self._checkpoint_record_key(left)
+            rk = self._checkpoint_record_key(right)
+            return (lk > rk) - (lk < rk)
+        left_auc = float(left.get("auc", float("-inf")))
+        right_auc = float(right.get("auc", float("-inf")))
+        if abs(left_auc - right_auc) > 0.0003:
+            return (left_auc > right_auc) - (left_auc < right_auc)
+        for key, reverse in [("logloss", False), ("brier", False), ("prob_gap", False)]:
+            lv = float(left.get(key, float("inf")))
+            rv = float(right.get(key, float("inf")))
+            if lv == rv:
+                continue
+            return (rv > lv) - (rv < lv) if not reverse else (lv > rv) - (lv < rv)
+        return 0
+
+    def _checkpoint_is_better(self, left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+        return self._checkpoint_compare(left, right) > 0
+
+    def _maybe_save_top_k_checkpoint(
+        self,
+        total_step: int,
+        epoch: int,
+        val_auc: float,
+        val_logloss: float,
+        val_metrics: Optional[Dict[str, float]],
+    ) -> None:
+        metrics = val_metrics or {}
+        brier = float(metrics.get("brier", float("inf")))
+        prob_mean = float(metrics.get("prob_mean", float("nan")))
+        label_mean = float(metrics.get("label_mean", float("nan")))
+        prob_gap = (
+            abs(prob_mean - label_mean)
+            if np.isfinite(prob_mean) and np.isfinite(label_mean)
+            else float("inf")
+        )
+        record = {
+            "step": int(total_step),
+            "epoch": int(epoch),
+            "auc": float(val_auc),
+            "logloss": float(val_logloss),
+            "brier": brier,
+            "prob_gap": prob_gap,
+            "path": "",
+        }
+        if len(self._top_checkpoint_records) >= self.keep_top_k_checkpoints:
+            worst = sorted(
+                self._top_checkpoint_records,
+                key=cmp_to_key(self._checkpoint_compare),
+            )[0]
+            if not self._checkpoint_is_better(record, worst):
+                logging.info(
+                    "Top-k checkpoint skipped: step=%d epoch=%d AUC=%.6f LogLoss=%.6f",
+                    total_step, epoch, val_auc, val_logloss)
+                return
+            shutil.rmtree(worst["path"], ignore_errors=True)
+            logging.info("Removed old top-k checkpoint: %s", worst["path"])
+            self._top_checkpoint_records.remove(worst)
+
+        save_metrics = {
+            "epoch": float(epoch),
+            "auc": float(val_auc),
+            "logloss": float(val_logloss),
+            "brier": brier,
+        }
+        ckpt_dir = self._save_step_checkpoint(
+            total_step,
+            is_best=False,
+            skip_model_file=False,
+            metrics=save_metrics,
+            dir_suffix=".topk",
+        )
+        record["path"] = ckpt_dir
+        self._top_checkpoint_records.append(record)
+        self._top_checkpoint_records.sort(
+            key=cmp_to_key(self._checkpoint_compare),
+            reverse=True,
+        )
+        logging.info(
+            "Top-k checkpoint saved: rank_metric=%s, rank=%d/%d, path=%s",
+            self.checkpoint_select_metric,
+            self._top_checkpoint_records.index(record) + 1,
+            self.keep_top_k_checkpoints,
+            ckpt_dir,
+        )
 
     def _batch_to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """Move all tensors in ``batch`` to ``self.device`` (``non_blocking=True``,
@@ -263,8 +392,10 @@ class PCVRHyFormerRankingTrainer:
     def _handle_validation_result(
         self,
         total_step: int,
+        epoch: int,
         val_auc: float,
         val_logloss: float,
+        val_metrics: Optional[Dict[str, float]] = None,
     ) -> None:
         """Persist a new-best checkpoint atomically.
 
@@ -289,27 +420,36 @@ class PCVRHyFormerRankingTrainer:
            razor-close score that tripped ``is_likely_new_best`` but not
            ``EarlyStopping``'s own gate does not create a stray dir.
         """
-        if self.checkpoint_select_metric == 'last':
-            best_dir = os.path.join(
-                self.save_dir,
-                self._build_step_dir_name(total_step, is_best=True),
+        if self.always_save_last_checkpoint:
+            for old_last_dir in glob.glob(os.path.join(self.save_dir, "global_step*.last")):
+                shutil.rmtree(old_last_dir, ignore_errors=True)
+                logging.info("Removed old last checkpoint: %s", old_last_dir)
+            last_dir = self._save_step_checkpoint(
+                total_step,
+                is_best=False,
+                skip_model_file=False,
+                metrics={
+                    "epoch": float(epoch),
+                    "auc": float(val_auc),
+                    "logloss": float(val_logloss),
+                    "brier": float((val_metrics or {}).get("brier", float("nan"))),
+                },
+                dir_suffix=".last",
             )
-            self.early_stopping.checkpoint_path = os.path.join(best_dir, "model.pt")
-            self._remove_old_best_dirs()
-            self._save_step_checkpoint(total_step, is_best=True, skip_model_file=False)
-            self.early_stopping.best_score = val_auc
-            self.early_stopping.best_saved_score = val_auc
-            self.early_stopping.best_extra_metrics = {
+            logging.info("Last checkpoint saved: %s", last_dir)
+
+        use_legacy_auc_best = (
+            self.keep_top_k_checkpoints == 1
+            and self.checkpoint_select_metric == 'auc'
+        )
+        if not use_legacy_auc_best:
+            self._maybe_save_top_k_checkpoint(
+                total_step, epoch, val_auc, val_logloss, val_metrics)
+            self.early_stopping(val_auc, self.model, {
                 "best_val_AUC": val_auc,
                 "best_val_logloss": val_logloss,
-                "checkpoint_select_metric": "last",
-            }
-            self.early_stopping.counter = 0
-            self.early_stopping.early_stop = False
-            logging.info(
-                "checkpoint_select_metric=last: saved current epoch as best_model "
-                f"(monitor AUC={val_auc:.6f}, LogLoss={val_logloss:.6f})"
-            )
+                "checkpoint_select_metric": self.checkpoint_select_metric,
+            })
             return
 
         old_best = self.early_stopping.best_score
@@ -393,7 +533,8 @@ class PCVRHyFormerRankingTrainer:
 
                     self._log_scalar_metrics('Valid', val_metrics, total_step, log_to_file=True)
 
-                    self._handle_validation_result(total_step, val_auc, val_logloss)
+                    self._handle_validation_result(
+                        total_step, epoch, val_auc, val_logloss, val_metrics)
 
                     if self.early_stopping.early_stop:
                         logging.info(f"Early stopping at step {total_step}")
@@ -430,7 +571,8 @@ class PCVRHyFormerRankingTrainer:
 
             self._log_scalar_metrics('Valid', val_metrics, total_step, log_to_file=True)
 
-            self._handle_validation_result(total_step, val_auc, val_logloss)
+            self._handle_validation_result(
+                total_step, epoch, val_auc, val_logloss, val_metrics)
 
             if self.early_stopping.early_stop:
                 logging.info(f"Early stopping at epoch {epoch}")
