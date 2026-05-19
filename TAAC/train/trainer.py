@@ -646,6 +646,7 @@ class PCVRHyFormerRankingTrainer:
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
             seq_time_deltas=seq_time_deltas,
+            timestamp=device_batch.get('timestamp', None),
             time_context=device_batch.get('time_context', None),
             seq_recent_stats=device_batch.get('seq_recent_stats', None),
             pair_dense_feats=device_batch.get('pair_dense_feats', None),

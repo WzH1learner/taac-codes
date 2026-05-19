@@ -17,6 +17,7 @@ class ModelInput(NamedTuple):
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
     seq_time_deltas: dict  # {domain: tensor [B, L]}, normalized log time gap
+    timestamp: Optional[torch.Tensor] = None
     time_context: Optional[torch.Tensor] = None  # [B, 2 + num_domains * 3]
     seq_recent_stats: Optional[torch.Tensor] = None  # [B, 4 domains * 7 stats]
     pair_dense_feats: Optional[torch.Tensor] = None  # [B, selected_pairs * 7 stats]
@@ -1408,6 +1409,102 @@ class AlignedUserIntDenseProjector(nn.Module):
         return self.mlp(torch.stack(pooled_vectors, dim=1).mean(dim=1))
 
 
+class UserDenseIntPairGateProjector(nn.Module):
+    """Light side branch for same-fid user_int/user_dense pairs."""
+
+    STATS_FIDS = {62, 63, 64, 65, 66}
+
+    def __init__(
+        self,
+        d_model: int,
+        emb_dim: int,
+        pair_specs: List[Dict[str, Any]],
+        hidden_mult: int = 1,
+        weight_clip: float = 20.0,
+    ) -> None:
+        super().__init__()
+        self.pair_specs = pair_specs
+        self.weight_clip = float(weight_clip)
+        self.weight_norms = nn.ModuleDict()
+        for spec in pair_specs:
+            if int(spec["length"]) > 1:
+                self.weight_norms[str(spec["fid"])] = nn.LayerNorm(int(spec["length"]))
+        self.input_proj = (
+            nn.Identity() if emb_dim == d_model else nn.Linear(emb_dim, d_model)
+        )
+        hidden_dim = max(d_model, d_model * hidden_mult)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def _transform_weight(self, weights: torch.Tensor, fid: int) -> torch.Tensor:
+        if fid in self.STATS_FIDS:
+            weights = torch.sign(weights) * torch.log1p(torch.abs(weights))
+        weights = torch.clamp(weights, -self.weight_clip, self.weight_clip)
+        key = str(fid)
+        if key in self.weight_norms:
+            weights = self.weight_norms[key](weights)
+        return weights
+
+    def forward(
+        self,
+        user_int_feats: torch.Tensor,
+        user_dense_feats: torch.Tensor,
+        tokenizer: nn.Module,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        pooled_vectors = []
+        weight_values = []
+        for spec in self.pair_specs:
+            fid = int(spec["fid"])
+            length = int(spec["length"])
+            ids = user_int_feats[:, spec["int_offset"]:spec["int_offset"] + length].long()
+            dense_w = user_dense_feats[:, spec["dense_offset"]:spec["dense_offset"] + length]
+            valid = (ids > 0).to(dense_w.dtype)
+            emb = tokenizer.embs[int(spec["emb_real_idx"])](ids)
+            weights = self._transform_weight(dense_w, fid) * valid
+            count = valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+            pooled = (emb * weights.unsqueeze(-1)).sum(dim=1) / count
+            pooled_vectors.append(self.input_proj(pooled))
+            if weights.numel() > 0:
+                weight_values.append(weights.detach())
+        if not pooled_vectors:
+            d_model = self.mlp[-1].normalized_shape[0]
+            return user_dense_feats.new_zeros(user_dense_feats.shape[0], d_model), {}
+        side_repr = self.mlp(torch.stack(pooled_vectors, dim=1).mean(dim=1))
+        if weight_values:
+            all_weights = torch.cat([w.reshape(-1) for w in weight_values])
+            stats = {
+                "dense_weight_mean": float(all_weights.mean().item()),
+                "dense_weight_std": float(all_weights.std(unbiased=False).item()),
+                "side_repr_norm": float(side_repr.detach().norm(dim=-1).mean().item()),
+            }
+        else:
+            stats = {}
+        return side_repr, stats
+
+
+class UserTimePeriodicProjector(nn.Module):
+    """Project root timestamp periodic user/context features to d_model."""
+
+    def __init__(self, input_dim: int, d_model: int) -> None:
+        super().__init__()
+        hidden_dim = max(d_model, d_model * 2)
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1457,6 +1554,15 @@ class PCVRHyFormer(nn.Module):
         use_aligned_user_int_dense: Union[bool, int] = False,
         aligned_user_int_dense_gate_init: float = 0.05,
         aligned_user_int_dense_fids: Optional[List[int]] = None,
+        use_user_dense_int_pair_gate: Union[bool, int] = False,
+        user_dense_int_pair_gate_init: float = 0.01,
+        user_dense_int_pair_fids: Optional[List[int]] = None,
+        user_dense_int_pair_exclude_fids: Optional[List[int]] = None,
+        user_dense_int_pair_mode: str = "gated_side",
+        use_user_time_periodic: Union[bool, int] = False,
+        user_time_periodic_gate_init: float = 0.01,
+        user_time_periodic_features: Optional[List[str]] = None,
+        user_time_periodic_use_sincos: Union[bool, int] = True,
         use_target_matched_recency: Union[bool, int] = False,
         target_matched_recency_dim: int = 32,
         target_matched_recency_gate_init: float = 0.005,
@@ -1494,6 +1600,19 @@ class PCVRHyFormer(nn.Module):
         self.use_pair_dense = bool(use_pair_dense)
         self.pair_dense_dim = int(pair_dense_dim)
         self.use_aligned_user_int_dense = bool(use_aligned_user_int_dense)
+        self.use_user_dense_int_pair_gate = bool(use_user_dense_int_pair_gate)
+        self.user_dense_int_pair_mode = str(user_dense_int_pair_mode)
+        if self.user_dense_int_pair_mode != "gated_side":
+            raise ValueError("user_dense_int_pair_mode currently supports only 'gated_side'")
+        self.use_user_time_periodic = bool(use_user_time_periodic)
+        self.user_time_periodic_features = [
+            str(x) for x in (
+                user_time_periodic_features
+                if user_time_periodic_features is not None
+                else ["hour", "weekday", "is_weekend"]
+            )
+        ]
+        self.user_time_periodic_use_sincos = bool(user_time_periodic_use_sincos)
         self.use_target_matched_recency = bool(use_target_matched_recency)
         self.target_matched_recency_dim = int(target_matched_recency_dim)
         self.target_matched_recency_feature_mode = str(target_matched_recency_feature_mode)
@@ -1660,6 +1779,125 @@ class PCVRHyFormer(nn.Module):
                 self.use_aligned_user_int_dense = False
         else:
             logging.info("aligned_user_int_dense disabled")
+
+        self.user_dense_int_pair_specs: List[Dict[str, Any]] = []
+        self.user_dense_int_pair_exclude_fids = [
+            int(fid) for fid in (
+                user_dense_int_pair_exclude_fids
+                if user_dense_int_pair_exclude_fids is not None
+                else [89, 90, 91]
+            )
+        ]
+        if self.use_user_dense_int_pair_gate:
+            pair_fids = [
+                int(fid) for fid in (
+                    user_dense_int_pair_fids
+                    if user_dense_int_pair_fids is not None
+                    else [62, 63, 64, 65, 66]
+                )
+            ]
+            exclude_set = set(self.user_dense_int_pair_exclude_fids)
+            int_fid_to_idx = {
+                int(fid): idx for idx, fid in enumerate(user_int_feature_fids or [])
+            }
+            dense_fid_to_spec = {
+                int(fid): (int(offset), int(length))
+                for fid, offset, length in (user_dense_feature_specs or [])
+            }
+            for fid in pair_fids:
+                if fid in exclude_set:
+                    logging.info("user_dense_int_pair_gate: fid=%s excluded; skipped", fid)
+                    continue
+                if fid not in int_fid_to_idx:
+                    logging.warning("user_dense_int_pair_gate: user_int fid=%s missing; skipped", fid)
+                    continue
+                if fid not in dense_fid_to_spec:
+                    logging.warning("user_dense_int_pair_gate: user_dense fid=%s missing; skipped", fid)
+                    continue
+                int_idx = int_fid_to_idx[fid]
+                vs, int_offset, int_length = user_int_feature_specs[int_idx]
+                emb_real_idx = self.user_ns_tokenizer._emb_index[int_idx]
+                if emb_real_idx == -1:
+                    logging.warning(
+                        "user_dense_int_pair_gate: fid=%s embedding skipped by vocab filter; skipped",
+                        fid,
+                    )
+                    continue
+                dense_offset, dense_length = dense_fid_to_spec[fid]
+                use_length = min(int(int_length), int(dense_length))
+                if use_length <= 0:
+                    logging.warning("user_dense_int_pair_gate: fid=%s has no usable aligned dim; skipped", fid)
+                    continue
+                if int(int_length) != int(dense_length):
+                    logging.warning(
+                        "user_dense_int_pair_gate: fid=%s int_len=%d dense_len=%d; using first %d positions",
+                        fid,
+                        int(int_length),
+                        int(dense_length),
+                        use_length,
+                    )
+                self.user_dense_int_pair_specs.append({
+                    "fid": fid,
+                    "int_offset": int(int_offset),
+                    "dense_offset": int(dense_offset),
+                    "length": use_length,
+                    "emb_real_idx": int(emb_real_idx),
+                    "vocab_size": int(vs),
+                })
+            if self.user_dense_int_pair_specs:
+                self.user_dense_int_pair_proj = UserDenseIntPairGateProjector(
+                    d_model=d_model,
+                    emb_dim=emb_dim,
+                    pair_specs=self.user_dense_int_pair_specs,
+                )
+                self.user_dense_int_pair_gate = nn.Parameter(
+                    torch.tensor(float(user_dense_int_pair_gate_init), dtype=torch.float32))
+                self._user_dense_int_pair_logged = False
+                logging.info(
+                    "user_dense_int_pair_gate enabled: requested_fids=%s, active_fids=%s, "
+                    "excluded_fids=%s, gate_init=%.4f",
+                    pair_fids,
+                    [spec["fid"] for spec in self.user_dense_int_pair_specs],
+                    self.user_dense_int_pair_exclude_fids,
+                    float(user_dense_int_pair_gate_init),
+                )
+            else:
+                logging.warning(
+                    "user_dense_int_pair_gate requested but no usable same-fid pairs were found; "
+                    "residual disabled")
+                self.use_user_dense_int_pair_gate = False
+        else:
+            logging.info("user_dense_int_pair_gate disabled")
+
+        if self.use_user_time_periodic:
+            time_input_dim = 0
+            for feature in self.user_time_periodic_features:
+                if feature in ("hour", "weekday") and self.user_time_periodic_use_sincos:
+                    time_input_dim += 2
+                elif feature in ("hour", "weekday", "is_weekend"):
+                    time_input_dim += 1
+                else:
+                    logging.warning("user_time_periodic: unknown feature=%s; ignored", feature)
+            if time_input_dim > 0:
+                self.user_time_periodic_proj = UserTimePeriodicProjector(
+                    input_dim=time_input_dim,
+                    d_model=d_model,
+                )
+                self.user_time_periodic_gate = nn.Parameter(
+                    torch.tensor(float(user_time_periodic_gate_init), dtype=torch.float32))
+                self._user_time_periodic_logged = False
+                logging.info(
+                    "user_time_periodic enabled: features=%s, use_sincos=%s, input_dim=%d, gate_init=%.4f",
+                    self.user_time_periodic_features,
+                    self.user_time_periodic_use_sincos,
+                    time_input_dim,
+                    float(user_time_periodic_gate_init),
+                )
+            else:
+                logging.warning("user_time_periodic requested but no usable features were found; disabled")
+                self.use_user_time_periodic = False
+        else:
+            logging.info("user_time_periodic disabled")
 
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
@@ -2256,6 +2494,106 @@ class PCVRHyFormer(nn.Module):
             + self.aligned_user_int_dense_gate.to(final_repr.dtype) * aligned_repr
         )
 
+    def _apply_user_dense_int_pair_gate(
+        self,
+        final_repr: torch.Tensor,
+        inputs: ModelInput,
+    ) -> torch.Tensor:
+        if not self.use_user_dense_int_pair_gate:
+            return final_repr
+        side_repr, stats = self.user_dense_int_pair_proj(
+            inputs.user_int_feats,
+            inputs.user_dense_feats.to(dtype=final_repr.dtype),
+            self.user_ns_tokenizer,
+        )
+        side_repr = side_repr.to(device=final_repr.device, dtype=final_repr.dtype)
+        if not self._user_dense_int_pair_logged:
+            logging.info(
+                "user_dense_int_pair_gate diagnostics: active_fids=%s, excluded_fids=%s, "
+                "gate=%.6f, side_repr_norm=%.6f, dense_weight_mean=%.6f, dense_weight_std=%.6f",
+                [spec["fid"] for spec in self.user_dense_int_pair_specs],
+                self.user_dense_int_pair_exclude_fids,
+                float(self.user_dense_int_pair_gate.detach().cpu().item()),
+                float(stats.get("side_repr_norm", 0.0)),
+                float(stats.get("dense_weight_mean", 0.0)),
+                float(stats.get("dense_weight_std", 0.0)),
+            )
+            self._user_dense_int_pair_logged = True
+        return final_repr + self.user_dense_int_pair_gate.to(final_repr.dtype) * side_repr
+
+    def _make_user_time_periodic_feats(
+        self,
+        inputs: ModelInput,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if inputs.timestamp is None:
+            if not self._user_time_periodic_logged:
+                logging.warning("user_time_periodic enabled but timestamp is missing; residual skipped")
+                self._user_time_periodic_logged = True
+            return None
+        ts = inputs.timestamp.to(device=device).reshape(-1).long()
+        cn_ts = ts + 8 * 3600
+        hour = ((cn_ts // 3600) % 24).float()
+        weekday = (((cn_ts // 86400) + 3) % 7).float()
+        is_weekend = (weekday >= 5).float()
+
+        parts = []
+        for feature in self.user_time_periodic_features:
+            if feature == "hour":
+                if self.user_time_periodic_use_sincos:
+                    angle = 2.0 * math.pi * hour / 24.0
+                    parts.extend([torch.sin(angle), torch.cos(angle)])
+                else:
+                    parts.append(hour / 23.0)
+            elif feature == "weekday":
+                if self.user_time_periodic_use_sincos:
+                    angle = 2.0 * math.pi * weekday / 7.0
+                    parts.extend([torch.sin(angle), torch.cos(angle)])
+                else:
+                    parts.append(weekday / 6.0)
+            elif feature == "is_weekend":
+                parts.append(is_weekend)
+        if not parts:
+            return None
+        feats = torch.stack(parts, dim=1).to(device=device, dtype=dtype)
+        if not self._user_time_periodic_logged:
+            with torch.no_grad():
+                counts = torch.bincount(hour.long().detach().cpu(), minlength=24)
+                top = torch.topk(counts, k=min(5, int(counts.numel())))
+                hour_head = [
+                    (int(idx), int(cnt))
+                    for idx, cnt in zip(top.indices.tolist(), top.values.tolist())
+                    if int(cnt) > 0
+                ]
+            logging.info(
+                "user_time_periodic diagnostics: features=%s, use_sincos=%s, gate=%.6f, "
+                "hour_distribution_head=%s",
+                self.user_time_periodic_features,
+                self.user_time_periodic_use_sincos,
+                float(self.user_time_periodic_gate.detach().cpu().item()),
+                hour_head,
+            )
+            self._user_time_periodic_logged = True
+        return feats
+
+    def _apply_user_time_periodic(
+        self,
+        final_repr: torch.Tensor,
+        inputs: ModelInput,
+    ) -> torch.Tensor:
+        if not self.use_user_time_periodic:
+            return final_repr
+        feats = self._make_user_time_periodic_feats(
+            inputs,
+            dtype=final_repr.dtype,
+            device=final_repr.device,
+        )
+        if feats is None:
+            return final_repr
+        time_repr = self.user_time_periodic_proj(feats)
+        return final_repr + self.user_time_periodic_gate.to(final_repr.dtype) * time_repr
+
     def _apply_target_matched_recency(
         self,
         final_repr: torch.Tensor,
@@ -2319,6 +2657,8 @@ class PCVRHyFormer(nn.Module):
         output = self._apply_seq_recent_stats(output, inputs)
         output = self._apply_pair_dense(output, inputs)
         output = self._apply_aligned_user_int_dense(output, inputs)
+        output = self._apply_user_dense_int_pair_gate(output, inputs)
+        output = self._apply_user_time_periodic(output, inputs)
         output = self._apply_target_matched_recency(output, inputs)
 
         # 5. Classifier
@@ -2365,6 +2705,8 @@ class PCVRHyFormer(nn.Module):
         output = self._apply_seq_recent_stats(output, inputs)
         output = self._apply_pair_dense(output, inputs)
         output = self._apply_aligned_user_int_dense(output, inputs)
+        output = self._apply_user_dense_int_pair_gate(output, inputs)
+        output = self._apply_user_time_periodic(output, inputs)
         output = self._apply_target_matched_recency(output, inputs)
 
         logits = self.clsfier(output)

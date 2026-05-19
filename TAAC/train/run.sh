@@ -31,6 +31,15 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --seq_target_match_flag_specs_json "" \
     --seq_d_side_projector_type flat \
     --seq_d_important_side_fids_json "" \
+    --use_user_dense_int_pair_gate 0 \
+    --user_dense_int_pair_gate_init 0.01 \
+    --user_dense_int_pair_fids_json "" \
+    --user_dense_int_pair_exclude_fids_json "" \
+    --user_dense_int_pair_mode gated_side \
+    --use_user_time_periodic 0 \
+    --user_time_periodic_gate_init 0.01 \
+    --user_time_periodic_features_json "" \
+    --user_time_periodic_use_sincos 1 \
     --emb_skip_threshold 5000000 \
     --batch_size 128 \
     --num_workers 8 \
@@ -75,6 +84,35 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #
 # D01_sparse_lr003_epoch10:
 #   bash TAAC/train/run.sh --sparse_lr 0.03 --num_epochs 10 --patience 5
+
+# ---- A02 candidate: user dense/int same-fid gated side branch ----
+# Purpose: split the useful UE-aligned dense/int pairs from A01, exclude 89-91,
+# and keep the branch small-gated instead of replacing D01 user_dense grouped.
+# Only variable vs active D01:
+#     --use_user_dense_int_pair_gate 0 -> 1
+#
+# Platform command:
+#   bash TAAC/train/run.sh \
+#     --use_user_dense_int_pair_gate 1 \
+#     --user_dense_int_pair_gate_init 0.01 \
+#     --user_dense_int_pair_fids_json '[62,63,64,65,66]' \
+#     --user_dense_int_pair_exclude_fids_json '[89,90,91]' \
+#     --num_epochs 10 \
+#     --patience 5
+
+# ---- T02 candidate: user-side periodic time gate ----
+# Purpose: revisit time using only root timestamp CN hour/weekday/weekend on
+# the user/context side with a small gate; no seq recency or old time_context.
+# Only variable vs active D01:
+#     --use_user_time_periodic 0 -> 1
+#
+# Platform command:
+#   bash TAAC/train/run.sh \
+#     --use_user_time_periodic 1 \
+#     --user_time_periodic_gate_init 0.01 \
+#     --user_time_periodic_use_sincos 1 \
+#     --num_epochs 10 \
+#     --patience 5
 
 # ---- A01 candidate: aligned user_int/user_dense weighted pooling ----
 # Purpose: use same-fid user_dense values as weights over aligned user_int

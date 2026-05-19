@@ -35,6 +35,9 @@ from trainer import PCVRHyFormerRankingTrainer
 
 DEFAULT_ALIGNED_USER_INT_DENSE_FIDS = [62, 63, 64, 65, 66, 89, 90, 91]
 DEFAULT_SEQ_D_IMPORTANT_SIDE_FIDS = [25, 24]
+DEFAULT_USER_DENSE_INT_PAIR_FIDS = [62, 63, 64, 65, 66]
+DEFAULT_USER_DENSE_INT_PAIR_EXCLUDE_FIDS = [89, 90, 91]
+DEFAULT_USER_TIME_PERIODIC_FEATURES = ["hour", "weekday", "is_weekend"]
 
 
 def build_feature_specs(
@@ -117,6 +120,28 @@ def load_seq_d_important_side_fids(fids_json: str) -> List[int]:
     else:
         values = json.loads(fids_json)
     return [int(v) for v in values]
+
+
+def load_int_list_json(values_json: str, default: List[int]) -> List[int]:
+    if not values_json:
+        return list(default)
+    if os.path.exists(values_json):
+        with open(values_json, 'r', encoding='utf-8') as f:
+            values = json.load(f)
+    else:
+        values = json.loads(values_json)
+    return [int(v) for v in values]
+
+
+def load_str_list_json(values_json: str, default: List[str]) -> List[str]:
+    if not values_json:
+        return list(default)
+    if os.path.exists(values_json):
+        with open(values_json, 'r', encoding='utf-8') as f:
+            values = json.load(f)
+    else:
+        values = json.loads(values_json)
+    return [str(v) for v in values]
 
 
 def parse_args() -> argparse.Namespace:
@@ -280,6 +305,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--aligned_user_int_dense_fids_json', type=str, default='',
                         help='Path to or inline JSON list of aligned fids; empty uses '
                              'the default A01 fids')
+    parser.add_argument('--use_user_dense_int_pair_gate', type=int, default=0, choices=[0, 1],
+                        help='Add gated same-fid user_int/user_dense side branch residual')
+    parser.add_argument('--user_dense_int_pair_gate_init', type=float, default=0.01,
+                        help='Initial scalar residual gate for --use_user_dense_int_pair_gate')
+    parser.add_argument('--user_dense_int_pair_fids_json', type=str, default='',
+                        help='Path to or inline JSON list of same-fid pairs; empty uses [62..66]')
+    parser.add_argument('--user_dense_int_pair_exclude_fids_json', type=str, default='',
+                        help='Path to or inline JSON list of excluded pair fids; empty uses [89,90,91]')
+    parser.add_argument('--user_dense_int_pair_mode', type=str, default='gated_side',
+                        choices=['gated_side'],
+                        help='A02 branch mode')
+    parser.add_argument('--use_user_time_periodic', type=int, default=0, choices=[0, 1],
+                        help='Add CN hour/weekday/is_weekend periodic user/context side residual')
+    parser.add_argument('--user_time_periodic_gate_init', type=float, default=0.01,
+                        help='Initial scalar residual gate for --use_user_time_periodic')
+    parser.add_argument('--user_time_periodic_features_json', type=str, default='',
+                        help='Path to or inline JSON list of time features; empty uses hour/weekday/is_weekend')
+    parser.add_argument('--user_time_periodic_use_sincos', type=int, default=1, choices=[0, 1],
+                        help='Use sin/cos encoding for cyclic hour and weekday')
     parser.add_argument('--use_target_matched_recency', type=int, default=0, choices=[0, 1],
                         help='Add target-matched recency any features as a final residual')
     parser.add_argument('--target_matched_recency_gate_init', type=float, default=0.005,
@@ -375,6 +419,15 @@ def parse_args() -> argparse.Namespace:
     args.pair_dense_dim = len(args.pair_dense_pairs) * PAIR_DENSE_FEATS_PER_PAIR
     args.aligned_user_int_dense_fids = load_aligned_user_int_dense_fids(
         args.aligned_user_int_dense_fids_json)
+    args.user_dense_int_pair_fids = load_int_list_json(
+        args.user_dense_int_pair_fids_json,
+        DEFAULT_USER_DENSE_INT_PAIR_FIDS)
+    args.user_dense_int_pair_exclude_fids = load_int_list_json(
+        args.user_dense_int_pair_exclude_fids_json,
+        DEFAULT_USER_DENSE_INT_PAIR_EXCLUDE_FIDS)
+    args.user_time_periodic_features = load_str_list_json(
+        args.user_time_periodic_features_json,
+        DEFAULT_USER_TIME_PERIODIC_FEATURES)
     args.target_matched_recency_pairs_windows = (
         load_target_matched_recency_pairs_windows(
             args.target_matched_recency_pairs_windows_json))
@@ -429,6 +482,21 @@ def main() -> None:
         f"use_aligned_user_int_dense={args.use_aligned_user_int_dense}, "
         f"aligned_user_int_dense_gate_init={args.aligned_user_int_dense_gate_init}, "
         f"aligned_user_int_dense_fids={args.aligned_user_int_dense_fids}"
+    )
+    logging.info(
+        "Effective user_dense_int_pair_gate config: "
+        f"use_user_dense_int_pair_gate={args.use_user_dense_int_pair_gate}, "
+        f"user_dense_int_pair_gate_init={args.user_dense_int_pair_gate_init}, "
+        f"user_dense_int_pair_fids={args.user_dense_int_pair_fids}, "
+        f"user_dense_int_pair_exclude_fids={args.user_dense_int_pair_exclude_fids}, "
+        f"user_dense_int_pair_mode={args.user_dense_int_pair_mode}"
+    )
+    logging.info(
+        "Effective user_time_periodic config: "
+        f"use_user_time_periodic={args.use_user_time_periodic}, "
+        f"user_time_periodic_gate_init={args.user_time_periodic_gate_init}, "
+        f"user_time_periodic_features={args.user_time_periodic_features}, "
+        f"user_time_periodic_use_sincos={args.user_time_periodic_use_sincos}"
     )
     logging.info(
         "Effective target_matched_recency config: "
@@ -561,6 +629,15 @@ def main() -> None:
         "use_aligned_user_int_dense": bool(args.use_aligned_user_int_dense),
         "aligned_user_int_dense_gate_init": args.aligned_user_int_dense_gate_init,
         "aligned_user_int_dense_fids": args.aligned_user_int_dense_fids,
+        "use_user_dense_int_pair_gate": bool(args.use_user_dense_int_pair_gate),
+        "user_dense_int_pair_gate_init": args.user_dense_int_pair_gate_init,
+        "user_dense_int_pair_fids": args.user_dense_int_pair_fids,
+        "user_dense_int_pair_exclude_fids": args.user_dense_int_pair_exclude_fids,
+        "user_dense_int_pair_mode": args.user_dense_int_pair_mode,
+        "use_user_time_periodic": bool(args.use_user_time_periodic),
+        "user_time_periodic_gate_init": args.user_time_periodic_gate_init,
+        "user_time_periodic_features": args.user_time_periodic_features,
+        "user_time_periodic_use_sincos": bool(args.user_time_periodic_use_sincos),
         "use_target_matched_recency": bool(args.use_target_matched_recency),
         "target_matched_recency_dim": args.target_matched_recency_dim,
         "target_matched_recency_gate_init": args.target_matched_recency_gate_init,

@@ -85,6 +85,15 @@ _FALLBACK_MODEL_CFG = {
     'use_aligned_user_int_dense': False,
     'aligned_user_int_dense_gate_init': 0.05,
     'aligned_user_int_dense_fids': [62, 63, 64, 65, 66, 89, 90, 91],
+    'use_user_dense_int_pair_gate': False,
+    'user_dense_int_pair_gate_init': 0.01,
+    'user_dense_int_pair_fids': [62, 63, 64, 65, 66],
+    'user_dense_int_pair_exclude_fids': [89, 90, 91],
+    'user_dense_int_pair_mode': 'gated_side',
+    'use_user_time_periodic': False,
+    'user_time_periodic_gate_init': 0.01,
+    'user_time_periodic_features': ['hour', 'weekday', 'is_weekend'],
+    'user_time_periodic_use_sincos': True,
     'use_target_matched_recency': False,
     'target_matched_recency_dim': TARGET_MATCHED_RECENCY_DIM,
     'target_matched_recency_gate_init': 0.005,
@@ -498,6 +507,7 @@ def _batch_to_model_input(
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
         seq_time_deltas=seq_time_deltas,
+        timestamp=device_batch.get('timestamp', None),
         time_context=device_batch.get('time_context', None),
         seq_recent_stats=device_batch.get('seq_recent_stats', None),
         pair_dense_feats=device_batch.get('pair_dense_feats', None),
@@ -583,6 +593,25 @@ def main() -> None:
         model_cfg.get('use_aligned_user_int_dense'),
         model_cfg.get('aligned_user_int_dense_gate_init'),
         model_cfg.get('aligned_user_int_dense_fids'),
+    )
+    logging.info(
+        "Effective user_dense_int_pair_gate config: use_user_dense_int_pair_gate=%s, "
+        "user_dense_int_pair_gate_init=%s, user_dense_int_pair_fids=%s, "
+        "user_dense_int_pair_exclude_fids=%s, user_dense_int_pair_mode=%s",
+        model_cfg.get('use_user_dense_int_pair_gate'),
+        model_cfg.get('user_dense_int_pair_gate_init'),
+        model_cfg.get('user_dense_int_pair_fids'),
+        model_cfg.get('user_dense_int_pair_exclude_fids'),
+        model_cfg.get('user_dense_int_pair_mode'),
+    )
+    logging.info(
+        "Effective user_time_periodic config: use_user_time_periodic=%s, "
+        "user_time_periodic_gate_init=%s, user_time_periodic_features=%s, "
+        "user_time_periodic_use_sincos=%s",
+        model_cfg.get('use_user_time_periodic'),
+        model_cfg.get('user_time_periodic_gate_init'),
+        model_cfg.get('user_time_periodic_features'),
+        model_cfg.get('user_time_periodic_use_sincos'),
     )
     logging.info(
         "Effective target_matched_recency config: use_target_matched_recency=%s, "
