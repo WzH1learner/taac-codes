@@ -122,6 +122,7 @@ python research/code/time_signal_eda.py \
 | P4b_seq_d_target_match_token_flag_lite_83_6_gate005 | D01 + token-level seq_d target-match flags `[83,6]`, gate `0.005` | TBD | TBD | TBD | `0.8028` | Rejected. Pause P4 series; do not continue P4c / flag-specific gates. |
 | S01_seq_d_sideinfo_grouped_projector_25_24 | D01 + grouped seq_d sideinfo projector for fids `[25,24]` | 6 | `0.864147` | `0.222898` | `0.801289` | Rejected. Official score is far below D01. |
 | D03_seq_len_192_384 | D01 + longer sequence length | TBD | `0.864719` | TBD | `0.811244` | Rejected. Valid improved but official did not transfer. |
+| A02_user_dense_int_pair_gate_62_66_no8991 | D01 + gated same-fid user_int/user_dense side branch, fids `[62..66]`, exclude `[89,90,91]`, gate `0.01` | 8 | `0.863886` | `0.223215` | TBD | Weak candidate only. AUC below D01 but still rising; prob_mean normal. Do not eval unless AUC >= `0.86435` with normal prob_mean. |
 
 ## Active Direction
 
@@ -131,6 +132,7 @@ python research/code/time_signal_eda.py \
 | `checkpoint top-k infrastructure` | Required before more reruns | D01 reruns / seed sweep must keep top-k checkpoints and compare AUC near-ties by LogLoss/Brier/prob-gap. |
 | `I01/P3/P4/S01/A01/P2/D03` | Paused | Do not continue new structures until D01-adjacent search is exhausted. |
 | `P4 target-match token flags` | Paused / rejected | P4 full official `0.808359`; P4b official `0.8028`. Do not continue P4c or flag-specific gates for now. |
+| `A02_user_dense_int_pair_gate` | Weak candidate / no eval yet | epoch8 valid AUC `0.863886`, LogLoss `0.223215`, Brier `0.064170`, prob_mean `0.097750`. Can test longer convergence or gate `0.02`; keep `[89,90,91]` excluded and do not mix with T02. |
 | `test_aware_feature_audit` | Completed for P4 full | `rows_scanned=200000`, `parquet_files_scanned=1000`, `strong_and_stable_specs=3`, `risky_specs=2`. |
 | `P3a_target_matched_recency_any_lite` | Rejected as residual route | Valid AUC `0.864184`, LogLoss `0.225655`, prob_mean `0.080864`; do not continue final_repr residual recency. |
 | `A01_aligned_user_int_dense_weighted_pooling_no_compile` | Rejected as residual route | prob_mean was compressed; do not continue A01 before stronger evidence. |
@@ -409,6 +411,68 @@ No RankMixer token is added.
 Do not enable time_context, seq_recent_stats, or pair_dense.
 Do not change loss/lr/dropout/seq_len/emb_skip_threshold.
 Run no-compile only; F00b reduce-overhead compile is rejected.
+```
+
+## A02_user_dense_int_pair_gate_62_66_no8991
+
+Current result:
+
+```text
+best observed epoch = 8
+valid AUC = 0.8638862957897601
+LogLoss = 0.22321513295173645
+Brier = 0.0641699
+label_mean = 0.0967852
+prob_mean = 0.0977497
+prob_std = 0.162892
+```
+
+Interpretation:
+
+```text
+AUC is below D01, so do not eval this checkpoint.
+Within-run valid AUC was still rising by epoch8.
+prob_mean is healthy and not compressed like P3/P4/A01.
+LogLoss/Brier are reasonable.
+This looks more like slow convergence or a weak side branch than a broken route.
+```
+
+Allowed follow-ups:
+
+```bash
+# A02_long_user_dense_int_pair_gate_epoch14
+bash TAAC/train/run.sh \
+  --use_user_dense_int_pair_gate 1 \
+  --user_dense_int_pair_gate_init 0.01 \
+  --user_dense_int_pair_fids_json '[62,63,64,65,66]' \
+  --user_dense_int_pair_exclude_fids_json '[89,90,91]' \
+  --num_epochs 14 \
+  --patience 6 \
+  --keep_top_k_checkpoints 3 \
+  --checkpoint_select_metric auc_then_logloss
+```
+
+```bash
+# A02_gate02_user_dense_int_pair_gate_62_66_no8991
+bash TAAC/train/run.sh \
+  --use_user_dense_int_pair_gate 1 \
+  --user_dense_int_pair_gate_init 0.02 \
+  --user_dense_int_pair_fids_json '[62,63,64,65,66]' \
+  --user_dense_int_pair_exclude_fids_json '[89,90,91]' \
+  --num_epochs 10 \
+  --patience 5 \
+  --keep_top_k_checkpoints 3 \
+  --checkpoint_select_metric auc_then_logloss
+```
+
+Guardrails:
+
+```text
+Do not add back 89/90/91.
+Do not mix with T02.
+Do not change sparse_lr/dropout/seq_len.
+Eval threshold: valid AUC >= 0.86435 and prob_mean normal.
+If LogLoss/Brier improve but AUC stays below threshold, do not eval.
 ```
 
 ## F00_fast_screening

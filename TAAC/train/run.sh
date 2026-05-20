@@ -99,6 +99,36 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --user_dense_int_pair_exclude_fids_json '[89,90,91]' \
 #     --num_epochs 10 \
 #     --patience 5
+#
+# Current result: epoch8 valid AUC=0.863886, LogLoss=0.223215,
+# Brier=0.064170, prob_mean=0.097750. AUC is below D01, but AUC was still
+# rising, prob_mean stayed healthy, and calibration was reasonable. Do not eval
+# unless valid AUC >= 0.86435 with normal prob_mean.
+#
+# A02_long_user_dense_int_pair_gate_epoch14:
+#   bash TAAC/train/run.sh \
+#     --use_user_dense_int_pair_gate 1 \
+#     --user_dense_int_pair_gate_init 0.01 \
+#     --user_dense_int_pair_fids_json '[62,63,64,65,66]' \
+#     --user_dense_int_pair_exclude_fids_json '[89,90,91]' \
+#     --num_epochs 14 \
+#     --patience 6 \
+#     --keep_top_k_checkpoints 3 \
+#     --checkpoint_select_metric auc_then_logloss
+#
+# A02_gate02_user_dense_int_pair_gate_62_66_no8991:
+#   bash TAAC/train/run.sh \
+#     --use_user_dense_int_pair_gate 1 \
+#     --user_dense_int_pair_gate_init 0.02 \
+#     --user_dense_int_pair_fids_json '[62,63,64,65,66]' \
+#     --user_dense_int_pair_exclude_fids_json '[89,90,91]' \
+#     --num_epochs 10 \
+#     --patience 5 \
+#     --keep_top_k_checkpoints 3 \
+#     --checkpoint_select_metric auc_then_logloss
+#
+# Guardrails: do not add back 89/90/91, do not mix with T02, and do not change
+# sparse_lr/dropout/seq_len. Good LogLoss/Brier alone is not enough for eval.
 
 # ---- T02 candidate: user-side periodic time gate ----
 # Purpose: revisit time using only root timestamp CN hour/weekday/weekend on
